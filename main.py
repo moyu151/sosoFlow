@@ -792,10 +792,13 @@ async def edit_query_message_text_or_caption(query, text: str, reply_markup=None
     message = query.message
     if not message:
         return
-    if getattr(message, "photo", None) or getattr(message, "video", None) or getattr(message, "document", None):
-        await query.edit_message_caption(caption=text, reply_markup=reply_markup)
-        return
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    try:
+        if getattr(message, "photo", None) or getattr(message, "video", None) or getattr(message, "document", None):
+            await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+            return
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except Exception:
+        await message.reply_text(text, reply_markup=reply_markup)
 
 
 def build_tasks_list_keyboard(tasks: list[Task], page: int):

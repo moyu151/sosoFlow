@@ -27,6 +27,9 @@
   - `tasks_list` / `tasks_page` / `menu_home` 回调统一使用上述安全编辑方法
   - 私聊快捷入口“📋 任务列表/➕ 新建任务”改为优先处理，并清理残留 `pending_input_action` 相关状态，避免输入流程卡住
   - 等待输入状态下，若收到上述快捷文本，放行到快捷入口，不再被参数解析分支拦截
+- 进一步增强“任务列表按钮”容错：
+  - `edit_query_message_text_or_caption` 增加 `try/except` 兜底
+  - 当编辑原消息失败（例如消息类型/状态不允许编辑）时，自动回退为 `reply_text` 发送新消息，确保按钮点击后有稳定响应
 - 本轮改动文件：
   - `main.py`
   - `README.md`
