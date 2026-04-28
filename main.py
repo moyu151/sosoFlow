@@ -380,6 +380,22 @@ def get_current_task(user_id: int) -> Optional[Task]:
         return session.get(Task, state.current_task_id)
 
 
+def get_or_create_task_by_pair(session, source_chat_id: int, target_chat_id: int) -> tuple[Task, bool]:
+    existing = session.scalar(
+        select(Task).where(Task.source_chat_id == source_chat_id, Task.target_chat_id == target_chat_id).order_by(Task.id.asc())
+    )
+    if existing:
+        return existing, False
+    task_name = f"task_{abs(source_chat_id)}_{abs(target_chat_id)}"
+    task = Task(name=task_name, source_chat_id=source_chat_id, target_chat_id=target_chat_id)
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    session.add(TaskFilter(task_id=task.id))
+    session.commit()
+    return task, True
+
+
 def ensure_task_filter(session, task_id: int) -> TaskFilter:
     task_filter = session.scalar(select(TaskFilter).where(TaskFilter.task_id == task_id))
     if task_filter:
@@ -1843,8 +1859,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"⚠️ 二次确认删除任务 {task.id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认删除", callback_data=f"task_delete_yes:{task.id}")]]))
             return
         elif action == "task_delete_yes":
-            session.delete(task)
-            session.commit()
+            try:
+                # 先删除关联数据，避免 PostgreSQL 外键约束导致“确认删除无响应”
+                queue_rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id)).all()
+                for row in queue_rows:
+                    session.delete(row)
+                log_rows = session.scalars(select(PublishLog).where(PublishLog.task_id == task.id)).all()
+                for row in log_rows:
+                    session.delete(row)
+                session.delete(task)
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.exception("task_delete_yes failed task_id=%s err=%s", task.id, exc)
+                await query.message.reply_text("⚠️ 删除失败，请稍后重试")
+                return
             tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
             if not tasks:
                 await edit_query_message_text_or_caption(query, "🗑 已删除任务，当前暂无任务", reply_markup=simple_back_home_keyboard())
@@ -1895,13 +1924,11 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
         except ValueError as exc:
             await msg.reply_text(f"⚠️ 参数错误：{exc}\n请重新输入目标频道/群组ID")
             return True
-        task_name = f"task_{abs(source_chat_id)}_{abs(target_chat_id)}"
+        if source_chat_id == target_chat_id:
+            await msg.reply_text("⚠️ 来源ID和目标ID不能相同，请重新输入目标频道/群组ID。")
+            return True
         with SessionLocal() as session:
-            task = Task(name=task_name, source_chat_id=source_chat_id, target_chat_id=target_chat_id)
-            session.add(task)
-            session.commit()
-            session.refresh(task)
-            session.add(TaskFilter(task_id=task.id))
+            task, created = get_or_create_task_by_pair(session, source_chat_id, target_chat_id)
             state = session.scalar(select(UserState).where(UserState.user_id == update.effective_user.id))
             if not state:
                 state = UserState(user_id=update.effective_user.id, current_task_id=task.id)
@@ -1909,13 +1936,19 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 state.current_task_id = task.id
             session.commit()
+            context.user_data.pop("pending_input_action", None)
+            context.user_data.pop("pending_task_source_chat_id", None)
             kb = task_detail_keyboard(task.id)
-            await msg.reply_text(
-                f"✅ 任务创建成功并已选中\nID={task.id}\n名称: {task_name}\n源: {source_chat_id}\n目标: {target_chat_id}",
-                reply_markup=kb,
-            )
-        context.user_data.pop("pending_input_action", None)
-        context.user_data.pop("pending_task_source_chat_id", None)
+            if created:
+                await msg.reply_text(
+                    f"✅ 任务创建成功并已选中\nID={task.id}\n名称: {task.name}\n源: {source_chat_id}\n目标: {target_chat_id}",
+                    reply_markup=kb,
+                )
+            else:
+                await msg.reply_text(
+                    f"✅ 已使用现有任务并选中\nID={task.id}\n名称: {task.name}\n源: {source_chat_id}\n目标: {target_chat_id}",
+                    reply_markup=kb,
+                )
         return True
     if action == "search_task":
         keyword = text.strip()
@@ -2212,13 +2245,11 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await msg.reply_text("⚠️ 创建流程已失效，请重新点击“➕ 新建任务”。")
                 return
             target_chat_id = forward_chat_id
-            task_name = f"task_{abs(source_chat_id)}_{abs(target_chat_id)}"
+            if source_chat_id == target_chat_id:
+                await msg.reply_text("⚠️ 识别到来源ID与目标ID相同，请转发目标频道/群组消息或直接输入目标ID。")
+                return
             with SessionLocal() as session:
-                task = Task(name=task_name, source_chat_id=source_chat_id, target_chat_id=target_chat_id)
-                session.add(task)
-                session.commit()
-                session.refresh(task)
-                session.add(TaskFilter(task_id=task.id))
+                task, created = get_or_create_task_by_pair(session, source_chat_id, target_chat_id)
                 state = session.scalar(select(UserState).where(UserState.user_id == update.effective_user.id))
                 if not state:
                     state = UserState(user_id=update.effective_user.id, current_task_id=task.id)
@@ -2226,12 +2257,18 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     state.current_task_id = task.id
                 session.commit()
-            await msg.reply_text(
-                f"✅ 已自动确认目标ID并创建任务\nID={task.id}\n名称: {task_name}\n源: {source_chat_id}\n目标: {target_chat_id}",
-                reply_markup=task_detail_keyboard(task.id),
-            )
             context.user_data.pop("pending_input_action", None)
             context.user_data.pop("pending_task_source_chat_id", None)
+            if created:
+                await msg.reply_text(
+                    f"✅ 已自动确认目标ID并创建任务\nID={task.id}\n名称: {task.name}\n源: {source_chat_id}\n目标: {target_chat_id}",
+                    reply_markup=task_detail_keyboard(task.id),
+                )
+            else:
+                await msg.reply_text(
+                    f"✅ 已自动确认目标ID并选中现有任务\nID={task.id}\n名称: {task.name}\n源: {source_chat_id}\n目标: {target_chat_id}",
+                    reply_markup=task_detail_keyboard(task.id),
+                )
             return
         if context.user_data.get("pending_input_action") == "edit_task_source":
             task_id = context.user_data.get("pending_task_id")
@@ -2285,6 +2322,9 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             "💡 点击数字可复制，然后发送给我确认；也可以在输入步骤直接转发，我会自动确认。",
             parse_mode=ParseMode.MARKDOWN,
         )
+        return
+    if msg.chat.type == "private" and context.user_data.get("pending_input_action") == "create_task_target" and not msg.text:
+        await msg.reply_text("⚠️ 未识别到目标ID。请直接输入目标频道/群组ID，或转发一条来自目标频道/群组的消息。")
         return
     source_chat_id = msg.chat_id
     text_value = msg.text or msg.caption or ""

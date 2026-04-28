@@ -73,6 +73,11 @@
   - 现象：`SELECT ... global_settings.debug_media_updates ...` 报错（列不存在）
   - 根因：`init_db` 中先执行 ORM 查询 `session.get(GlobalSetting, 1)`，后执行 `ALTER TABLE` 补列，顺序反了
   - 处理：调整 `init_db` 顺序为“先补齐 queue/global_settings 新列，再执行 ORM 查询与初始化逻辑”
+- 修复“新建任务转发目标无响应 + 任务列表大量重复（source=target）”：
+  - 新增 `get_or_create_task_by_pair`，按 `source_chat_id + target_chat_id` 幂等复用任务，避免重复创建
+  - 在“创建任务目标ID”流程中新增保护：来源ID与目标ID相同时不创建任务，并明确提示重新输入/转发
+  - 对“等待目标ID”且消息无法解析（非文本且未识别转发ID）场景增加明确反馈，不再静默无响应
+  - 转发创建与文本创建两条路径统一使用幂等逻辑，并在复用现有任务时提示“已选中现有任务”
 - 本轮改动文件：
   - `main.py`
   - `README.md`
