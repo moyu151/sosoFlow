@@ -1568,17 +1568,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         task_id = parse_int(raw_task_id, "task_id")
     except ValueError:
-        await query.edit_message_text("回调参数错误")
+        await edit_query_message_text_or_caption(query, "回调参数错误")
         return
     with SessionLocal() as session:
         task = session.get(Task, task_id)
         if not task:
-            await query.edit_message_text("任务不存在")
+            await edit_query_message_text_or_caption(query, "任务不存在")
             return
         if action == "task_view":
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
             target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
-            await query.edit_message_text(
+            await edit_query_message_text_or_caption(
+                query,
                 build_task_detail_text(session, task, source_name=source_name, target_name=target_name),
                 reply_markup=task_detail_keyboard(task_id),
             )
@@ -1588,7 +1589,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
             target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
-            await query.edit_message_text(
+            await edit_query_message_text_or_caption(
+                query,
                 build_task_detail_text(session, task, source_name=source_name, target_name=target_name),
                 reply_markup=task_detail_keyboard(task_id),
             )
@@ -1599,7 +1601,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
             target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
-            await query.edit_message_text(
+            await edit_query_message_text_or_caption(
+                query,
                 build_task_detail_text(session, task, source_name=source_name, target_name=target_name),
                 reply_markup=task_detail_keyboard(task_id),
             )
@@ -1641,7 +1644,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         elif action == "task_settings":
-            await query.edit_message_text(
+            await edit_query_message_text_or_caption(
+                query,
                 build_task_settings_text(task),
                 reply_markup=task_settings_keyboard(task),
             )
@@ -1649,19 +1653,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "task_toggle_mode":
             task.mode = TaskModeEnum.forward if task.mode == TaskModeEnum.copy else TaskModeEnum.copy
             session.commit()
-            await query.edit_message_text(build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
+            await edit_query_message_text_or_caption(query, build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
             await query.message.reply_text(f"✅ 模式已切换为 {mode_label(task.mode)}")
             return
         elif action == "task_toggle_auto_capture":
             task.auto_capture_enabled = not task.auto_capture_enabled
             session.commit()
-            await query.edit_message_text(build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
+            await edit_query_message_text_or_caption(query, build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
             await query.message.reply_text(f"✅ 自动监听已设为 {bool_cn(task.auto_capture_enabled)}")
             return
         elif action == "task_toggle_delete":
             task.delete_after_success = not task.delete_after_success
             session.commit()
-            await query.edit_message_text(build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
+            await edit_query_message_text_or_caption(query, build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
             await query.message.reply_text(f"✅ 发布后删源已设为 {bool_cn(task.delete_after_success)}")
             return
         elif action == "task_input_interval":
@@ -1696,7 +1700,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif action == "task_filters":
             task_filter = ensure_task_filter(session, task.id)
-            await query.edit_message_text(
+            await edit_query_message_text_or_caption(
+                query,
                 f"🔍 过滤设置（任务 {task.id}）\n{filter_summary(task_filter)}",
                 reply_markup=task_filters_keyboard(task.id, task_filter),
             )
@@ -1763,9 +1768,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
             if not tasks:
-                await query.edit_message_text("🗑 已删除任务，当前暂无任务", reply_markup=simple_back_home_keyboard())
+                await edit_query_message_text_or_caption(query, "🗑 已删除任务，当前暂无任务", reply_markup=simple_back_home_keyboard())
             else:
-                await query.edit_message_text("🗑 已删除任务，返回任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
+                await edit_query_message_text_or_caption(query, "🗑 已删除任务，返回任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
             return
         await query.message.reply_text("✅ 操作完成。")
 

@@ -50,6 +50,11 @@
 - 修复 Neon/PostgreSQL 启动迁移报错：
   - 问题：`ALTER TABLE queue ADD COLUMN next_retry_at DATETIME` 在 PostgreSQL 报 `type "datetime" does not exist`
   - 处理：`init_db` 按数据库类型选择列类型：PostgreSQL 使用 `TIMESTAMP`，SQLite 使用 `DATETIME`
+- 修复“任务列表可打开但无法进入任务详情”反复问题（第 3 次）：
+  - 根因：回调流里仍存在多处直接 `query.edit_message_text`；当消息来源是 `photo+caption` 时会失败，表现为“点击无响应”
+  - 处理：将 `callback_handler` 中所有页面切换相关编辑统一替换为 `edit_query_message_text_or_caption`
+  - 覆盖场景：`task_view`、`task_start`、`task_pause`、`task_settings`、过滤页、删除后回流等
+  - 结果：不再依赖消息类型，图片/文本消息都可稳定跳转；编辑失败时仍可自动回退新消息发送
 - 本轮改动文件：
   - `main.py`
   - `README.md`
