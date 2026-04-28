@@ -74,7 +74,7 @@ def test_apply_filters_skip_reason():
     task_filter = TaskFilter(require_text=True)
     item = DummyQueueItem(has_text=False, has_photo=False, has_video=False, has_links=False, text_preview="")
     reason = apply_filters(item, task_filter)
-    assert reason == "需要文字"
+    assert reason == "仅保留纯文字"
 
 
 def test_apply_filters_unknown_metadata_pass():

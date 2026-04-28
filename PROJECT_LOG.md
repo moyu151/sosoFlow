@@ -129,6 +129,20 @@
   - 移除固定快捷值与“自定义”冗余按钮，保留直接输入链路
   - “时段”改为分步输入：先输入开始时间（HH:MM），再输入结束时间（HH:MM）
   - 模式/自动监听/发布后删源切换后，同步刷新设置面板内容与按钮状态
+- 交互与发布稳定性修复（问题清单对齐）：
+  - `/start` 恢复封面图发送逻辑（存在 `img/b.png` 时优先 `photo+caption+InlineKeyboard`，失败回退文字）
+  - 新建任务来源/目标输入提示补充“可转发自动识别、点击数字复制发送确认”说明
+  - 在来源/目标输入步骤中支持“直接转发自动确认”流程，避免手动复制输入
+  - 修复目标ID误识别：在等待 `target_chat_id` 时，转发消息优先使用转发来源 chat_id 自动确认，不再把转发正文中的数字当目标ID
+  - 任务设置新增“编辑来源ID/目标ID”按钮，支持在线重设源与目标
+  - 发布失败包含 `Forbidden: bot is not a member of the channel chat` 时，追加“将机器人添加到群组”快捷按钮
+  - 发布逻辑支持媒体组整体发布：同一 `media_group_id` 的 pending 项使用 `copy_messages/forward_messages` 批量发送，避免拆分成多次独立发布
+  - 过滤文案澄清：`文字` 调整为 `仅保留纯文字`（摘要与按钮文案同步）
+- 数据持久化默认路径优化（JustRunMyApp）：
+  - 默认 `DATABASE_URL` 从 `sqlite:///data.db` 调整为 `sqlite:////mnt/sosoflow/sosoflow.db`
+  - 保留环境变量优先级：若已设置 `DATABASE_URL`，继续优先使用环境变量
+  - 启动初始化时自动执行 `os.makedirs("/mnt/sosoflow", exist_ok=True)`，确保 SQLite 目录存在
+  - README 补充 JustRunMyApp 推荐配置 `DATABASE_URL=sqlite:////mnt/sosoflow/sosoflow.db`
 
 ### 当前状态
 
@@ -167,6 +181,8 @@
 - 本轮状态实时刷新修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮导入范围引导文案优化后再次验证：`python -m py_compile main.py` 通过
 - 本轮任务设置面板交互收敛后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮交互与发布稳定性修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮数据持久化默认路径优化后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 
 ### 下一步建议（最高优先）
 

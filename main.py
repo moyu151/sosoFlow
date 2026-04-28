@@ -183,7 +183,7 @@ def load_env() -> AppEnv:
         bot_token=token,
         super_admin_ids=parse_ids(os.getenv("SUPER_ADMIN_IDS", "")),
         admin_user_ids=parse_ids(os.getenv("ADMIN_USER_IDS", "")),
-        database_url=os.getenv("DATABASE_URL", "sqlite:///data.db"),
+        database_url=os.getenv("DATABASE_URL", "sqlite:////mnt/sosoflow/sosoflow.db"),
         tz=os.getenv("TZ", "Asia/Shanghai"),
         deploy_version=os.getenv("DEPLOY_VERSION", "").strip() or os.getenv("GIT_COMMIT", "").strip() or "unknown",
         startup_notify_chat_ids=parse_ids(os.getenv("STARTUP_NOTIFY_CHAT_IDS", "")),
@@ -313,7 +313,7 @@ def filter_summary(task_filter: TaskFilter) -> str:
     return (
         f"图片:{'开' if task_filter.require_photo else '关'} | "
         f"视频:{'开' if task_filter.require_video else '关'} | "
-        f"文字:{'开' if task_filter.require_text else '关'} | "
+        f"仅保留纯文字:{'开' if task_filter.require_text else '关'} | "
         f"排除链接:{'开' if task_filter.exclude_links else '关'} | "
         f"排除无字:{'开' if task_filter.exclude_no_text else '关'} | "
         f"排除转发:{'开' if task_filter.exclude_forwarded else '关'} | "
@@ -425,6 +425,10 @@ def task_settings_keyboard(task: Task):
             [InlineKeyboardButton(f"📊 日上限: {task.daily_limit}", callback_data=f"task_input_daily:{task.id}")],
             [InlineKeyboardButton(f"🕒 时段: {task.active_start_time}-{task.active_end_time}", callback_data=f"task_input_window:{task.id}")],
             [
+                InlineKeyboardButton(f"🧷 来源ID: {task.source_chat_id}", callback_data=f"task_edit_source:{task.id}"),
+                InlineKeyboardButton(f"🎯 目标ID: {task.target_chat_id}", callback_data=f"task_edit_target:{task.id}"),
+            ],
+            [
                 InlineKeyboardButton("🔍 过滤设置", callback_data=f"task_filters:{task.id}"),
                 InlineKeyboardButton("⬅️ 返回任务详情", callback_data=f"task_view:{task.id}"),
             ],
@@ -456,7 +460,7 @@ def task_filters_keyboard(task_id: int, task_filter: TaskFilter):
                 InlineKeyboardButton(f"🎬 视频 {on_off(task_filter.require_video)}", callback_data=f"task_filter_toggle:{task_id}:require_video"),
             ],
             [
-                InlineKeyboardButton(f"📝 文字 {on_off(task_filter.require_text)}", callback_data=f"task_filter_toggle:{task_id}:require_text"),
+                InlineKeyboardButton(f"📝 仅保留纯文字 {on_off(task_filter.require_text)}", callback_data=f"task_filter_toggle:{task_id}:require_text"),
                 InlineKeyboardButton(f"🔗 排链 {on_off(task_filter.exclude_links)}", callback_data=f"task_filter_toggle:{task_id}:exclude_links"),
             ],
             [
@@ -515,7 +519,7 @@ def apply_filters(item: QueueItem, task_filter: TaskFilter) -> Optional[str]:
     checks = [
         (task_filter.require_photo and not bool(item.has_photo), "需要图片"),
         (task_filter.require_video and not bool(item.has_video), "需要视频"),
-        (task_filter.require_text and not bool(item.has_text), "需要文字"),
+        (task_filter.require_text and not bool(item.has_text), "仅保留纯文字"),
         (task_filter.exclude_links and bool(item.has_links), "包含链接"),
         (task_filter.exclude_no_text and not bool(item.has_text), "无文字"),
         (task_filter.exclude_forwarded and bool(item.is_forwarded), "转发消息"),
@@ -539,6 +543,18 @@ def write_log(session, task_id: int, source_message_id: Optional[int], target_me
             action=action,
             message=message,
         )
+    )
+
+
+def add_bot_to_chat_keyboard(application: Application) -> Optional[InlineKeyboardMarkup]:
+    bot_user = getattr(application.bot, "username", None)
+    if not bot_user:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ 将机器人添加到群组", url=f"https://t.me/{bot_user}?startgroup=1")],
+            [InlineKeyboardButton("📘 添加到频道说明", callback_data="help_menu")],
+        ]
     )
 
 
@@ -587,6 +603,48 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
             session.commit()
             return f"已过滤 message_id={item.message_id} ({reason})"
         try:
+            same_album = []
+            if item.media_group_id:
+                same_album = session.scalars(
+                    select(QueueItem).where(
+                        QueueItem.task_id == db_task.id,
+                        QueueItem.status == QueueStatusEnum.pending,
+                        QueueItem.media_group_id == item.media_group_id,
+                    ).order_by(QueueItem.message_id.asc())
+                ).all()
+            if same_album:
+                message_ids = [x.message_id for x in same_album]
+                if db_task.mode == TaskModeEnum.copy:
+                    sent_ids = await application.bot.copy_messages(
+                        chat_id=db_task.target_chat_id,
+                        from_chat_id=db_task.source_chat_id,
+                        message_ids=message_ids,
+                    )
+                else:
+                    sent_ids = await application.bot.forward_messages(
+                        chat_id=db_task.target_chat_id,
+                        from_chat_id=db_task.source_chat_id,
+                        message_ids=message_ids,
+                    )
+                published_at = now()
+                for i, album_item in enumerate(same_album):
+                    target_id = sent_ids[i].message_id if i < len(sent_ids) else None
+                    album_item.status = QueueStatusEnum.published
+                    album_item.target_message_id = target_id
+                    album_item.published_at = published_at
+                    write_log(session, db_task.id, album_item.message_id, target_id, "publish", "发布成功")
+                    if db_task.delete_after_success:
+                        try:
+                            await application.bot.delete_message(chat_id=db_task.source_chat_id, message_id=album_item.message_id)
+                            album_item.deleted_at = now()
+                            write_log(session, db_task.id, album_item.message_id, target_id, "delete", "删除源消息成功")
+                        except Exception as delete_exc:
+                            msg = f"删除失败: {delete_exc}"
+                            album_item.fail_reason = msg
+                            write_log(session, db_task.id, album_item.message_id, target_id, "fail", msg)
+                db_task.last_published_at = published_at
+                session.commit()
+                return f"发布成功 media_group={item.media_group_id} count={len(same_album)}"
             if db_task.mode == TaskModeEnum.copy:
                 sent = await application.bot.copy_message(chat_id=db_task.target_chat_id, from_chat_id=db_task.source_chat_id, message_id=item.message_id)
                 target_id = sent.message_id if sent else None
@@ -643,7 +701,7 @@ def main_menu_text() -> str:
         "欢迎使用 sosoFlow 🚚\n\n"
         "常用功能：\n"
         "• 任务列表：查看并进入任务详情\n"
-        "• 新建任务：按提示输入来源ID和目标ID\n"
+        "• 新建任务：按提示输入来源ID和目标ID（也可直接转发自动识别）\n"
         "• 获取频道/群ID：转发消息给我自动识别"
     )
 
@@ -686,7 +744,14 @@ def build_tasks_list_keyboard(tasks: list[Task], page: int):
 @require_admin
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text(main_menu_text(), reply_markup=main_menu_keyboard())
+        if os.path.exists(COVER_IMAGE_PATH):
+            try:
+                with open(COVER_IMAGE_PATH, "rb") as fp:
+                    await update.message.reply_photo(photo=fp, caption=main_menu_text(), reply_markup=main_menu_keyboard())
+            except Exception:
+                await update.message.reply_text(main_menu_text(), reply_markup=main_menu_keyboard())
+        else:
+            await update.message.reply_text(main_menu_text(), reply_markup=main_menu_keyboard())
         await update.message.reply_text("ℹ️ 底部快捷面板已启用", reply_markup=quick_panel_keyboard())
 
 
@@ -1286,7 +1351,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "create_task_hint":
         context.user_data["pending_input_action"] = "create_task_source"
         await query.message.reply_text(
-            "✍️ 请输入来源频道/群组ID\n示例：-1001111111111",
+            "✍️ 请输入来源频道/群组ID\n示例：-1001111111111\n💡 可转发来源频道/群消息给机器人，点击识别出的数字复制后发送确认。",
         )
         return
     if data == "global_status":
@@ -1357,6 +1422,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "task_publish":
             result = await publish_one(context.application, task, ignore_interval=True, ignore_window=True)
             await query.message.reply_text(f"🚀 {result}")
+            if "Forbidden: bot is not a member of the channel chat" in result:
+                kb = add_bot_to_chat_keyboard(context.application)
+                if kb:
+                    await query.message.reply_text("⚠️ 机器人不在目标频道/群组，请先添加机器人后重试。", reply_markup=kb)
             return
         elif action == "task_retry":
             rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.failed)).all()
@@ -1418,6 +1487,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["pending_task_id"] = task.id
             context.user_data.pop("pending_window_start", None)
             await query.message.reply_text("✍️ 请输入开始时间（HH:MM）\n示例：09:00")
+            return
+        elif action == "task_edit_source":
+            context.user_data["pending_input_action"] = "edit_task_source"
+            context.user_data["pending_task_id"] = task.id
+            await query.message.reply_text(
+                "✍️ 请输入新的来源频道/群组ID\n示例：-1001111111111\n💡 可转发来源频道/群消息给机器人，点击识别出的数字复制后发送确认。"
+            )
+            return
+        elif action == "task_edit_target":
+            context.user_data["pending_input_action"] = "edit_task_target"
+            context.user_data["pending_task_id"] = task.id
+            await query.message.reply_text(
+                "✍️ 请输入新的目标频道/群组ID\n示例：-1002222222222\n💡 可转发目标频道/群消息给机器人，点击识别出的数字复制后发送确认。"
+            )
             return
         elif action == "task_filters":
             task_filter = ensure_task_filter(session, task.id)
@@ -1513,7 +1596,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
             return True
         context.user_data["pending_task_source_chat_id"] = source_chat_id
         context.user_data["pending_input_action"] = "create_task_target"
-        await msg.reply_text("✍️ 请输入目标频道/群组ID\n示例：-1002222222222")
+        await msg.reply_text("✍️ 请输入目标频道/群组ID\n示例：-1002222222222\n💡 可转发目标频道/群消息给机器人，点击识别出的数字复制后发送确认。")
         return True
     if action == "create_task_target":
         source_chat_id = context.user_data.get("pending_task_source_chat_id")
@@ -1726,6 +1809,62 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("pending_task_id", None)
         context.user_data.pop("pending_window_start", None)
         return True
+    if action == "edit_task_source":
+        task_id = context.user_data.get("pending_task_id")
+        if not task_id:
+            await msg.reply_text("未找到任务，请重新进入任务设置")
+            context.user_data.pop("pending_input_action", None)
+            return True
+        try:
+            source_chat_id = parse_int(text, "source_chat_id")
+        except ValueError as exc:
+            await msg.reply_text(f"⚠️ 参数错误：{exc}\n请重新输入来源频道/群组ID")
+            return True
+        with SessionLocal() as session:
+            task = session.get(Task, task_id)
+            if not task:
+                await msg.reply_text("任务不存在")
+                context.user_data.pop("pending_input_action", None)
+                context.user_data.pop("pending_task_id", None)
+                return True
+            task.source_chat_id = source_chat_id
+            session.commit()
+            session.refresh(task)
+            await msg.reply_text(
+                f"✅ 来源ID已更新为 {source_chat_id}",
+                reply_markup=task_settings_keyboard(task),
+            )
+        context.user_data.pop("pending_input_action", None)
+        context.user_data.pop("pending_task_id", None)
+        return True
+    if action == "edit_task_target":
+        task_id = context.user_data.get("pending_task_id")
+        if not task_id:
+            await msg.reply_text("未找到任务，请重新进入任务设置")
+            context.user_data.pop("pending_input_action", None)
+            return True
+        try:
+            target_chat_id = parse_int(text, "target_chat_id")
+        except ValueError as exc:
+            await msg.reply_text(f"⚠️ 参数错误：{exc}\n请重新输入目标频道/群组ID")
+            return True
+        with SessionLocal() as session:
+            task = session.get(Task, task_id)
+            if not task:
+                await msg.reply_text("任务不存在")
+                context.user_data.pop("pending_input_action", None)
+                context.user_data.pop("pending_task_id", None)
+                return True
+            task.target_chat_id = target_chat_id
+            session.commit()
+            session.refresh(task)
+            await msg.reply_text(
+                f"✅ 目标ID已更新为 {target_chat_id}",
+                reply_markup=task_settings_keyboard(task),
+            )
+        context.user_data.pop("pending_input_action", None)
+        context.user_data.pop("pending_task_id", None)
+        return True
     return False
 
 
@@ -1747,19 +1886,103 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 await msg.reply_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
             return
-            if text == "➕ 新建任务":
-                context.user_data["pending_input_action"] = "create_task_source"
-                await msg.reply_text("✍️ 请输入来源频道/群组ID\n示例：-1001111111111")
-                return
+        if text == "➕ 新建任务":
+            context.user_data["pending_input_action"] = "create_task_source"
+            await msg.reply_text("✍️ 请输入来源频道/群组ID\n示例：-1001111111111\n💡 可转发来源频道/群消息给机器人，点击识别出的数字复制后发送确认。")
+            return
     forward_chat_id = None
     if msg.forward_origin and getattr(msg.forward_origin, "chat", None):
         forward_chat_id = msg.forward_origin.chat.id
     elif getattr(msg, "forward_from_chat", None):
         forward_chat_id = msg.forward_from_chat.id
     if forward_chat_id is not None:
+        if context.user_data.get("pending_input_action") == "create_task_source":
+            context.user_data["pending_task_source_chat_id"] = forward_chat_id
+            context.user_data["pending_input_action"] = "create_task_target"
+            await msg.reply_text(
+                f"✅ 已自动确认来源ID：{forward_chat_id}\n"
+                "✍️ 请输入目标频道/群组ID\n示例：-1002222222222\n"
+                "💡 可转发目标频道/群消息给机器人，点击识别出的数字复制后发送确认。"
+            )
+            return
+        if context.user_data.get("pending_input_action") == "create_task_target":
+            source_chat_id = context.user_data.get("pending_task_source_chat_id")
+            if source_chat_id is None:
+                context.user_data.pop("pending_input_action", None)
+                await msg.reply_text("⚠️ 创建流程已失效，请重新点击“➕ 新建任务”。")
+                return
+            target_chat_id = forward_chat_id
+            task_name = f"task_{abs(source_chat_id)}_{abs(target_chat_id)}"
+            with SessionLocal() as session:
+                task = Task(name=task_name, source_chat_id=source_chat_id, target_chat_id=target_chat_id)
+                session.add(task)
+                session.commit()
+                session.refresh(task)
+                session.add(TaskFilter(task_id=task.id))
+                state = session.scalar(select(UserState).where(UserState.user_id == update.effective_user.id))
+                if not state:
+                    state = UserState(user_id=update.effective_user.id, current_task_id=task.id)
+                    session.add(state)
+                else:
+                    state.current_task_id = task.id
+                session.commit()
+            await msg.reply_text(
+                f"✅ 已自动确认目标ID并创建任务\nID={task.id}\n名称: {task_name}\n源: {source_chat_id}\n目标: {target_chat_id}",
+                reply_markup=task_detail_keyboard(task.id),
+            )
+            context.user_data.pop("pending_input_action", None)
+            context.user_data.pop("pending_task_source_chat_id", None)
+            return
+        if context.user_data.get("pending_input_action") == "edit_task_source":
+            task_id = context.user_data.get("pending_task_id")
+            if not task_id:
+                context.user_data.pop("pending_input_action", None)
+                await msg.reply_text("未找到任务，请重新进入任务设置")
+                return
+            with SessionLocal() as session:
+                task = session.get(Task, task_id)
+                if not task:
+                    await msg.reply_text("任务不存在")
+                    context.user_data.pop("pending_input_action", None)
+                    context.user_data.pop("pending_task_id", None)
+                    return
+                task.source_chat_id = forward_chat_id
+                session.commit()
+                session.refresh(task)
+                await msg.reply_text(
+                    f"✅ 已自动确认并更新来源ID：{forward_chat_id}",
+                    reply_markup=task_settings_keyboard(task),
+                )
+            context.user_data.pop("pending_input_action", None)
+            context.user_data.pop("pending_task_id", None)
+            return
+        if context.user_data.get("pending_input_action") == "edit_task_target":
+            task_id = context.user_data.get("pending_task_id")
+            if not task_id:
+                context.user_data.pop("pending_input_action", None)
+                await msg.reply_text("未找到任务，请重新进入任务设置")
+                return
+            with SessionLocal() as session:
+                task = session.get(Task, task_id)
+                if not task:
+                    await msg.reply_text("任务不存在")
+                    context.user_data.pop("pending_input_action", None)
+                    context.user_data.pop("pending_task_id", None)
+                    return
+                task.target_chat_id = forward_chat_id
+                session.commit()
+                session.refresh(task)
+                await msg.reply_text(
+                    f"✅ 已自动确认并更新目标ID：{forward_chat_id}",
+                    reply_markup=task_settings_keyboard(task),
+                )
+            context.user_data.pop("pending_input_action", None)
+            context.user_data.pop("pending_task_id", None)
+            return
         await msg.reply_text(
             f"📌 已识别转发来源ID：`{forward_chat_id}`\n"
-            "可直接用于新建任务的来源或目标ID。",
+            "可直接用于新建任务的来源或目标ID。\n"
+            "💡 点击数字可复制，然后发送给我确认；也可以在输入步骤直接转发，我会自动确认。",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -1844,6 +2067,7 @@ async def post_init_hook(application: Application):
 
 
 def init_db():
+    os.makedirs("/mnt/sosoflow", exist_ok=True)
     Base.metadata.create_all(engine)
     with SessionLocal() as session:
         setting = session.get(GlobalSetting, 1)
