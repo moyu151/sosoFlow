@@ -2417,27 +2417,7 @@ def init_db():
                     """
                 )
             )
-    with SessionLocal() as session:
-        setting = session.get(GlobalSetting, 1)
-        if not setting:
-            session.add(GlobalSetting(id=1, tick_seconds=60))
-        for uid in env.super_admin_ids:
-            existing = session.scalar(select(Admin).where(Admin.telegram_user_id == uid))
-            if not existing:
-                session.add(Admin(telegram_user_id=uid, role=RoleEnum.super))
-        for uid in env.admin_user_ids:
-            existing = session.scalar(select(Admin).where(Admin.telegram_user_id == uid))
-            if not existing:
-                session.add(Admin(telegram_user_id=uid, role=RoleEnum.admin))
-        # 历史默认时段迁移：将旧默认 09:00-23:30 统一迁移为全天
-        legacy_default_tasks = session.scalars(
-            select(Task).where(Task.active_start_time == "09:00", Task.active_end_time == "23:30")
-        ).all()
-        for t in legacy_default_tasks:
-            t.active_start_time = "00:00"
-            t.active_end_time = "23:59"
-        session.commit()
-    # 轻量自迁移：为旧库补齐 queue 新字段（SQLite 允许 ADD COLUMN）
+    # 轻量自迁移：为旧库补齐 queue/global_settings 新字段
     inspector = inspect(engine)
     columns = {col["name"] for col in inspector.get_columns("queue")}
     with engine.begin() as conn:
@@ -2458,6 +2438,26 @@ def init_db():
         if "debug_media_updates" not in gs_columns:
             conn.execute(sql_text("ALTER TABLE global_settings ADD COLUMN debug_media_updates BOOLEAN DEFAULT FALSE"))
             conn.execute(sql_text("UPDATE global_settings SET debug_media_updates = FALSE WHERE debug_media_updates IS NULL"))
+    with SessionLocal() as session:
+        setting = session.get(GlobalSetting, 1)
+        if not setting:
+            session.add(GlobalSetting(id=1, tick_seconds=60))
+        for uid in env.super_admin_ids:
+            existing = session.scalar(select(Admin).where(Admin.telegram_user_id == uid))
+            if not existing:
+                session.add(Admin(telegram_user_id=uid, role=RoleEnum.super))
+        for uid in env.admin_user_ids:
+            existing = session.scalar(select(Admin).where(Admin.telegram_user_id == uid))
+            if not existing:
+                session.add(Admin(telegram_user_id=uid, role=RoleEnum.admin))
+        # 历史默认时段迁移：将旧默认 09:00-23:30 统一迁移为全天
+        legacy_default_tasks = session.scalars(
+            select(Task).where(Task.active_start_time == "09:00", Task.active_end_time == "23:30")
+        ).all()
+        for t in legacy_default_tasks:
+            t.active_start_time = "00:00"
+            t.active_end_time = "23:59"
+        session.commit()
 
 
 def token_preview(token: str) -> str:

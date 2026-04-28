@@ -69,6 +69,10 @@
   - 监听 handler 显式覆盖 `message/channel_post/edited_message/edited_channel_post`
   - 新增 `queue.has_document` 字段并补充旧库 `ALTER TABLE`
   - `README` 增加媒体组诊断步骤说明
+- 修复 PostgreSQL 旧库 `global_settings.debug_media_updates` 列缺失导致启动异常：
+  - 现象：`SELECT ... global_settings.debug_media_updates ...` 报错（列不存在）
+  - 根因：`init_db` 中先执行 ORM 查询 `session.get(GlobalSetting, 1)`，后执行 `ALTER TABLE` 补列，顺序反了
+  - 处理：调整 `init_db` 顺序为“先补齐 queue/global_settings 新列，再执行 ORM 查询与初始化逻辑”
 - 本轮改动文件：
   - `main.py`
   - `README.md`
