@@ -119,6 +119,7 @@
 - `pytest` 通过（22 passed）
 - 本次“导入范围阻塞新帖”修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（35 passed）
 - 本次“媒体组占位补全”修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（36 passed）
+- 本次“channel_post 捕获链路修复”后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（37 passed）
 
 ### 增量更新（本次）
 
@@ -137,6 +138,13 @@
 - 新增回归测试：
   - `tests/test_media_group_publish.py` 增加 `test_import_placeholder_pending_can_be_hydrated_then_publish_as_album`
   - 验证“占位 pending 被补全后，发布路径走 `send_media_group` 而非拆发”
+- 修复“频道消息未进入捕获链路，导致 media_group_id 长期为 None”：
+  - 根因：`capture_new_message` 使用 `@require_admin`，而 `channel_post` 常见为 `effective_user=None`，被权限包装提前拦截
+  - 处理：移除该装饰器；改为仅在 `private` 私聊入口执行 `is_admin` 校验，频道/群消息按任务匹配正常入队
+  - 效果：来源频道新帖可稳定进入 auto_capture，并写入 `media_group_id/file_id/message_type`
+- 新增回归测试：
+  - `tests/test_capture_channel_post.py` 增加 `test_channel_post_without_effective_user_still_captured_with_media_group`
+  - 验证 `effective_user=None` 的 `channel_post` 仍能入队并保留媒体组元数据
 
 ### 下一步建议（最高优先）
 

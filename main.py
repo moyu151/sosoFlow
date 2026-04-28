@@ -2428,7 +2428,6 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
     return False
 
 
-@require_admin
 async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_type, typed_msg = classify_update_message(update)
     with SessionLocal() as session:
@@ -2440,6 +2439,13 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = typed_msg or update.effective_message
     if not msg or not msg.chat:
         return
+    # 频道消息(channel_post)没有 effective_user，不能走 require_admin 拦截。
+    # 仅私聊入口需要管理员校验，频道/群消息按 source_chat_id + auto_capture 规则入队。
+    if msg.chat.type == "private":
+        uid = update.effective_user.id if update.effective_user else 0
+        if not is_admin(uid):
+            await msg.reply_text(denied_text())
+            return
     if msg.chat.type == "private" and msg.text:
         text = msg.text.strip()
         if text == "📋 任务列表":
