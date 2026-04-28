@@ -502,6 +502,7 @@ def task_detail_keyboard(task_id: int):
             [InlineKeyboardButton("🚀 立即发布", callback_data=f"task_publish:{task_id}"), InlineKeyboardButton("📥 导入范围", callback_data=f"task_import_hint:{task_id}")],
             [InlineKeyboardButton("⚙️ 设置", callback_data=f"task_settings:{task_id}"), InlineKeyboardButton("🔁 重试失败", callback_data=f"task_retry:{task_id}")],
             [InlineKeyboardButton("🔄 刷新", callback_data=f"task_view:{task_id}")],
+            [InlineKeyboardButton("♻️ 重置任务", callback_data=f"task_reset_ask:{task_id}")],
             [InlineKeyboardButton("🗑 删除任务", callback_data=f"task_delete_ask:{task_id}")],
             [InlineKeyboardButton("⬅️ 返回任务列表", callback_data="tasks_list")],
         ]
@@ -995,6 +996,7 @@ def build_tasks_list_keyboard(tasks: list[Task], page: int):
         nav.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"tasks_page:{page + 1}"))
     rows.append(nav)
     rows.append([InlineKeyboardButton("🔎 搜索任务", callback_data="task_search_hint"), InlineKeyboardButton("🏠 主菜单", callback_data="menu_home")])
+    rows.append([InlineKeyboardButton("🧹 清空全部任务", callback_data="tasks_clear_all_ask")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1640,6 +1642,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task_count = session.scalar(select(func.count()).select_from(Task)) or 0
         await query.message.reply_text(f"📊 当前任务总数: {task_count}")
         return
+    if data == "tasks_clear_all_ask":
+        await query.message.reply_text(
+            "⚠️ 二次确认清空全部任务（会清除任务、队列、发布日志与任务选择状态）",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认清空全部任务", callback_data="tasks_clear_all_yes")]]),
+        )
+        return
+    if data == "tasks_clear_all_yes":
+        try:
+            with SessionLocal() as session:
+                queue_rows = session.scalars(select(QueueItem)).all()
+                for row in queue_rows:
+                    session.delete(row)
+                log_rows = session.scalars(select(PublishLog)).all()
+                for row in log_rows:
+                    session.delete(row)
+                filter_rows = session.scalars(select(TaskFilter)).all()
+                for row in filter_rows:
+                    session.delete(row)
+                task_rows = session.scalars(select(Task)).all()
+                for row in task_rows:
+                    session.delete(row)
+                state_rows = session.scalars(select(UserState)).all()
+                for row in state_rows:
+                    row.current_task_id = None
+                session.commit()
+            await edit_query_message_text_or_caption(query, "🧹 已清空全部任务", reply_markup=simple_back_home_keyboard())
+        except Exception as exc:
+            logger.exception("tasks_clear_all_yes failed err=%s", exc)
+            await query.message.reply_text("⚠️ 清空失败，请稍后重试")
+        return
     if data == "admins_list":
         with SessionLocal() as session:
             rows = session.scalars(select(Admin)).all()
@@ -1857,6 +1889,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif action == "task_delete_ask":
             await query.message.reply_text(f"⚠️ 二次确认删除任务 {task.id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认删除", callback_data=f"task_delete_yes:{task.id}")]]))
+            return
+        elif action == "task_reset_ask":
+            await query.message.reply_text(
+                f"⚠️ 二次确认重置任务 {task.id}（清空队列与日志，重置设置并暂停）",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认重置任务", callback_data=f"task_reset_yes:{task.id}")]]),
+            )
+            return
+        elif action == "task_reset_yes":
+            try:
+                queue_rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id)).all()
+                for row in queue_rows:
+                    session.delete(row)
+                log_rows = session.scalars(select(PublishLog).where(PublishLog.task_id == task.id)).all()
+                for row in log_rows:
+                    session.delete(row)
+                task_filter = ensure_task_filter(session, task.id)
+                task_filter.require_photo = False
+                task_filter.require_video = False
+                task_filter.require_text = False
+                task_filter.exclude_links = False
+                task_filter.exclude_no_text = False
+                task_filter.exclude_forwarded = False
+                task_filter.exclude_sticker = False
+                task_filter.exclude_poll = False
+                task_filter.min_text_length = None
+                task_filter.max_text_length = None
+                task.mode = TaskModeEnum.copy
+                task.interval_seconds = 1800
+                task.daily_limit = 100
+                task.active_start_time = "00:00"
+                task.active_end_time = "23:59"
+                task.enabled = False
+                task.auto_capture_enabled = True
+                task.delete_after_success = False
+                task.last_published_at = None
+                session.commit()
+            except Exception as exc:
+                session.rollback()
+                logger.exception("task_reset_yes failed task_id=%s err=%s", task.id, exc)
+                await query.message.reply_text("⚠️ 重置失败，请稍后重试")
+                return
+            source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
+            target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
+            await edit_query_message_text_or_caption(
+                query,
+                build_task_detail_text(session, task, source_name=source_name, target_name=target_name),
+                reply_markup=task_detail_keyboard(task.id),
+            )
+            await query.message.reply_text(f"✅ 任务 {task.id} 已重置并暂停")
             return
         elif action == "task_delete_yes":
             try:
