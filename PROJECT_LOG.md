@@ -30,12 +30,30 @@
 - 进一步增强“任务列表按钮”容错：
   - `edit_query_message_text_or_caption` 增加 `try/except` 兜底
   - 当编辑原消息失败（例如消息类型/状态不允许编辑）时，自动回退为 `reply_text` 发送新消息，确保按钮点击后有稳定响应
+- 优化 `/import_range` 后续发布可恢复性（新增 waiting 状态）：
+  - `queue.status` 扩展为：`pending / waiting / published / failed / skipped`
+  - `QueueItem` 新增字段：`retry_count`、`next_retry_at`
+  - 发布时命中“消息可能暂不存在”错误（如 `message to copy not found / message_id invalid / message not found / wrong message identifier`）时，不再直接 `failed`，改为 `waiting`
+  - `waiting` 重试策略：每 10 分钟重试一次；`retry_count` 超过 20 次后转 `failed`
+  - 发布选择策略：优先 `pending`；若无 `pending`，再取 `next_retry_at` 到期的 `waiting`
+  - 新消息自动监听恢复：若同 `message_id` 已存在且状态为 `waiting/failed`，更新 metadata 并改回 `pending`；若为 `published/skipped` 则不覆盖
+  - `/retry_failed` 扩展为同时重置 `failed + waiting -> pending`
+  - 新增 `/retry_waiting` 命令（仅重置 `waiting -> pending`）
+  - `/status`、`/task_status`、任务详情统计已增加 `waiting` 数量展示
+  - 启动兼容：`init_db` 为旧库自动补齐 `retry_count` / `next_retry_at` 字段（不做破坏性迁移）
+- 增强媒体组发布诊断日志（用于排查“为何仍一张张发送”）：
+  - 新增发布候选日志：`publish_pick`（message_id/status/media_group_id）
+  - 新增媒体组候选日志：`publish_album_candidates`（media_group_id/count）
+  - 无 `media_group_id` 时明确记录 `publish_single_item reason=no_media_group_id`
+  - 可走真正相册时记录 `publish_album_mode path=send_media_group`
+  - 走 fallback 时记录 `publish_album_mode path=fallback`，并输出明细（如 `message_type` 非 `photo/video/document` 或 `file_id_missing`）
 - 本轮改动文件：
   - `main.py`
   - `README.md`
   - `requirements.txt`
   - `PROJECT_LOG.md`
   - `tests/test_core.py`
+  - `tests/test_waiting_retry.py`
 
 ### 已验证项
 

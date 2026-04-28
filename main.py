@@ -34,6 +34,7 @@ from sqlalchemy import (
     create_engine,
     func,
     inspect,
+    or_,
     select,
     text as sql_text,
 )
@@ -64,6 +65,7 @@ class QueueStatusEnum(str, Enum):
     published = "published"
     failed = "failed"
     skipped = "skipped"
+    waiting = "waiting"
 
 
 class Admin(Base):
@@ -134,6 +136,8 @@ class QueueItem(Base):
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     fail_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     filter_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -211,6 +215,8 @@ scheduler = AsyncIOScheduler(timezone=env.tz)
 MAX_IMPORT_RANGE = 5000
 TASKS_PAGE_SIZE = 8
 COVER_IMAGE_PATH = os.path.join("img", "b.png")
+WAITING_RETRY_INTERVAL_MINUTES = 10
+WAITING_MAX_RETRY_COUNT = 20
 
 
 def parse_hhmm(value: str) -> time:
@@ -330,7 +336,7 @@ def ensure_task_filter(session, task_id: int) -> TaskFilter:
 
 def task_stats(session, task_id: int) -> dict[str, int]:
     data = {}
-    for status in [QueueStatusEnum.pending, QueueStatusEnum.published, QueueStatusEnum.failed, QueueStatusEnum.skipped]:
+    for status in [QueueStatusEnum.pending, QueueStatusEnum.waiting, QueueStatusEnum.published, QueueStatusEnum.failed, QueueStatusEnum.skipped]:
         count = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.task_id == task_id, QueueItem.status == status)) or 0
         data[status.value] = count
     return data
@@ -403,7 +409,7 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
         f"目标: {target_line}\n"
         f"模式: {mode_label(task.mode)}\n"
         f"状态: {'🟢运行中' if task.enabled else '⏸暂停'}\n"
-        f"队列统计: 待发布 {stats['pending']} | 已发布 {stats['published']} | 失败 {stats['failed']} | 跳过 {stats['skipped']}\n"
+        f"队列统计: 待发布 {stats['pending']} | 等待重试 {stats['waiting']} | 已发布 {stats['published']} | 失败 {stats['failed']} | 跳过 {stats['skipped']}\n"
         f"今日发布: {today_published}/{task.daily_limit}\n"
         f"间隔: {task.interval_seconds}s\n"
         f"下次可发布剩余: {next_publish_in_seconds}s\n"
@@ -559,6 +565,46 @@ def write_log(session, task_id: int, source_message_id: Optional[int], target_me
     )
 
 
+def is_retryable_missing_message_error(raw_error: str) -> bool:
+    text = (raw_error or "").lower()
+    keywords = [
+        "message to copy not found",
+        "message_id invalid",
+        "message not found",
+        "wrong message identifier",
+    ]
+    return any(keyword in text for keyword in keywords)
+
+
+def mark_item_waiting_or_failed(session, db_task: Task, queue_item: QueueItem, fail_msg: str):
+    queue_item.fail_reason = fail_msg
+    queue_item.retry_count = (queue_item.retry_count or 0) + 1
+    if queue_item.retry_count > WAITING_MAX_RETRY_COUNT:
+        queue_item.status = QueueStatusEnum.failed
+        queue_item.next_retry_at = None
+        write_log(session, db_task.id, queue_item.message_id, None, "fail", fail_msg)
+        return
+    queue_item.status = QueueStatusEnum.waiting
+    queue_item.next_retry_at = now() + timedelta(minutes=WAITING_RETRY_INTERVAL_MINUTES)
+    write_log(session, db_task.id, queue_item.message_id, None, "waiting", fail_msg)
+
+
+def pick_next_publish_item(session, task_id: int) -> Optional[QueueItem]:
+    pending_item = session.scalar(
+        select(QueueItem).where(QueueItem.task_id == task_id, QueueItem.status == QueueStatusEnum.pending).order_by(QueueItem.message_id.asc())
+    )
+    if pending_item:
+        return pending_item
+    return session.scalar(
+        select(QueueItem).where(
+            QueueItem.task_id == task_id,
+            QueueItem.status == QueueStatusEnum.waiting,
+            QueueItem.next_retry_at.is_not(None),
+            QueueItem.next_retry_at <= now(),
+        ).order_by(QueueItem.message_id.asc())
+    )
+
+
 def add_bot_to_chat_keyboard(application: Application) -> Optional[InlineKeyboardMarkup]:
     bot_user = getattr(application.bot, "username", None)
     if not bot_user:
@@ -592,11 +638,16 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
             elapsed = (now() - db_task.last_published_at).total_seconds()
             if elapsed < db_task.interval_seconds:
                 return "未到发布间隔"
-        item = session.scalar(
-            select(QueueItem).where(QueueItem.task_id == db_task.id, QueueItem.status == QueueStatusEnum.pending).order_by(QueueItem.message_id.asc())
-        )
+        item = pick_next_publish_item(session, db_task.id)
         if not item:
-            return "无 pending 消息"
+            return "无可发布消息（pending/waiting）"
+        logger.info(
+            "publish_pick task=%s message_id=%s status=%s media_group_id=%s",
+            db_task.id,
+            item.message_id,
+            item.status.value,
+            item.media_group_id,
+        )
         task_filter = ensure_task_filter(session, db_task.id)
         try:
             same_album = []
@@ -604,10 +655,21 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                 same_album = session.scalars(
                     select(QueueItem).where(
                         QueueItem.task_id == db_task.id,
-                        QueueItem.status == QueueStatusEnum.pending,
+                        or_(
+                            QueueItem.status == QueueStatusEnum.pending,
+                            (QueueItem.status == QueueStatusEnum.waiting) & QueueItem.next_retry_at.is_not(None) & (QueueItem.next_retry_at <= now()),
+                        ),
                         QueueItem.media_group_id == item.media_group_id,
                     ).order_by(QueueItem.message_id.asc())
                 ).all()
+                logger.info(
+                    "publish_album_candidates task=%s media_group_id=%s count=%s",
+                    db_task.id,
+                    item.media_group_id,
+                    len(same_album),
+                )
+            else:
+                logger.info("publish_single_item task=%s message_id=%s reason=no_media_group_id", db_task.id, item.message_id)
             if same_album:
                 # 整组过滤：任意一条不符合，则整组跳过
                 group_reason = None
@@ -619,6 +681,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                 if group_reason:
                     for album_item in same_album:
                         album_item.status = QueueStatusEnum.skipped
+                        album_item.fail_reason = None
+                        album_item.next_retry_at = None
                         album_item.filter_reason = group_reason
                         write_log(session, db_task.id, album_item.message_id, None, "filter", group_reason)
                     session.commit()
@@ -630,6 +694,12 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                 )
                 sent_ids = []
                 if can_send_media_group:
+                    logger.info(
+                        "publish_album_mode task=%s media_group_id=%s path=send_media_group count=%s",
+                        db_task.id,
+                        item.media_group_id,
+                        len(same_album),
+                    )
                     caption_text = next((x.caption for x in same_album if x.caption), None)
                     media = []
                     for idx, album_item in enumerate(same_album):
@@ -646,6 +716,18 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     )
                     sent_ids = [m for m in sent_messages]
                 else:
+                    missing_details = []
+                    for album_item in same_album[:10]:
+                        if not album_item.file_id or album_item.message_type not in {"photo", "video", "document"}:
+                            missing_details.append(
+                                f"{album_item.message_id}:{album_item.message_type or 'unknown'}:{'file_id_missing' if not album_item.file_id else 'ok'}"
+                            )
+                    logger.info(
+                        "publish_album_mode task=%s media_group_id=%s path=fallback reason=cannot_send_media_group details=%s",
+                        db_task.id,
+                        item.media_group_id,
+                        ",".join(missing_details) if missing_details else "unknown",
+                    )
                     if db_task.mode == TaskModeEnum.forward:
                         fallback_action = "fallback_forward_messages_due_to_missing_file_id_may_split_album"
                         write_log(session, db_task.id, item.message_id, None, "fallback", fallback_action)
@@ -678,6 +760,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     album_item.status = QueueStatusEnum.published
                     album_item.target_message_id = target_id
                     album_item.published_at = published_at
+                    album_item.fail_reason = None
+                    album_item.next_retry_at = None
                     write_log(session, db_task.id, album_item.message_id, target_id, "publish", "发布成功")
                     if db_task.delete_after_success:
                         try:
@@ -694,6 +778,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
             reason = apply_filters(item, task_filter)
             if reason:
                 item.status = QueueStatusEnum.skipped
+                item.fail_reason = None
+                item.next_retry_at = None
                 item.filter_reason = reason
                 write_log(session, db_task.id, item.message_id, None, "filter", reason)
                 session.commit()
@@ -707,6 +793,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
             item.status = QueueStatusEnum.published
             item.target_message_id = target_id
             item.published_at = now()
+            item.fail_reason = None
+            item.next_retry_at = None
             db_task.last_published_at = now()
             write_log(session, db_task.id, item.message_id, target_id, "publish", "发布成功")
             if db_task.delete_after_success:
@@ -728,16 +816,33 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     f"{raw_err}（该错误通常不是时段导致；可能是源消息受保护/复制受限，"
                     "可改用 forward 模式或检查源频道权限）"
                 )
+            should_waiting = is_retryable_missing_message_error(raw_err)
             if same_album:
                 for album_item in same_album:
-                    album_item.status = QueueStatusEnum.failed
-                    album_item.fail_reason = fail_msg
-                    write_log(session, db_task.id, album_item.message_id, None, "fail", fail_msg)
+                    if should_waiting:
+                        mark_item_waiting_or_failed(session, db_task, album_item, fail_msg)
+                    else:
+                        album_item.status = QueueStatusEnum.failed
+                        album_item.fail_reason = fail_msg
+                        album_item.next_retry_at = None
+                        write_log(session, db_task.id, album_item.message_id, None, "fail", fail_msg)
             else:
-                item.status = QueueStatusEnum.failed
-                item.fail_reason = fail_msg
-                write_log(session, db_task.id, item.message_id, None, "fail", fail_msg)
+                if should_waiting:
+                    mark_item_waiting_or_failed(session, db_task, item, fail_msg)
+                else:
+                    item.status = QueueStatusEnum.failed
+                    item.fail_reason = fail_msg
+                    item.next_retry_at = None
+                    write_log(session, db_task.id, item.message_id, None, "fail", fail_msg)
             session.commit()
+            if should_waiting:
+                if same_album:
+                    if all(album_item.status == QueueStatusEnum.failed for album_item in same_album):
+                        return f"发布失败（重试超限） message_id={item.message_id}: {fail_msg}"
+                    return f"等待重试 message_id={item.message_id}: {fail_msg}"
+                if item.status == QueueStatusEnum.failed:
+                    return f"发布失败（重试超限） message_id={item.message_id}: {fail_msg}"
+                return f"等待重试 message_id={item.message_id}: {fail_msg}"
             return f"发布失败 message_id={item.message_id}: {fail_msg}"
 
 
@@ -853,6 +958,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/publish_now 立即发布下一条 pending（忽略时间窗与间隔）\n"
         "/skip <message_id> 跳过当前任务队列消息\n"
         "/retry_failed 重试 failed 消息\n\n"
+        "/retry_waiting 重试 waiting 消息\n\n"
         "【设置】(admin/super)\n"
         "/set_interval <seconds> (必须 > 0)\n"
         "/set_daily_limit <count> (count>=0)\n"
@@ -886,6 +992,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_count = session.scalar(select(func.count()).select_from(Task)) or 0
         enabled_count = session.scalar(select(func.count()).select_from(Task).where(Task.enabled.is_(True))) or 0
         queue_pending = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.status == QueueStatusEnum.pending)) or 0
+        queue_waiting = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.status == QueueStatusEnum.waiting)) or 0
         today_published = session.scalar(
             select(func.count()).select_from(QueueItem).where(
                 QueueItem.status == QueueStatusEnum.published,
@@ -905,6 +1012,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"任务总数: {task_count}\n"
         f"运行中: {enabled_count}\n"
         f"pending: {queue_pending}\n"
+        f"waiting: {queue_waiting}\n"
         f"今日发布: {today_published}\n"
         f"今日失败: {today_failed}\n"
         f"累计失败: {failed_total}\n"
@@ -1081,12 +1189,34 @@ async def retry_failed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请先 /use_task <task_id>")
         return
     with SessionLocal() as session:
-        rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.failed)).all()
+        rows = session.scalars(
+            select(QueueItem).where(
+                QueueItem.task_id == task.id,
+                QueueItem.status.in_([QueueStatusEnum.failed, QueueStatusEnum.waiting]),
+            )
+        ).all()
         for row in rows:
             row.status = QueueStatusEnum.pending
             row.fail_reason = None
+            row.next_retry_at = None
         session.commit()
-    await update.message.reply_text(f"✅ 已重置 failed -> pending: {len(rows)}")
+    await update.message.reply_text(f"✅ 已重置 failed/waiting -> pending: {len(rows)}")
+
+
+@require_admin
+async def retry_waiting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task = get_current_task(update.effective_user.id)
+    if not task:
+        await update.message.reply_text("请先 /use_task <task_id>")
+        return
+    with SessionLocal() as session:
+        rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.waiting)).all()
+        for row in rows:
+            row.status = QueueStatusEnum.pending
+            row.fail_reason = None
+            row.next_retry_at = None
+        session.commit()
+    await update.message.reply_text(f"✅ 已重置 waiting -> pending: {len(rows)}")
 
 
 async def set_current_task_simple(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, value):
@@ -1484,12 +1614,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.reply_text("⚠️ 机器人不在目标频道/群组，请先添加机器人后重试。", reply_markup=kb)
             return
         elif action == "task_retry":
-            rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.failed)).all()
+            rows = session.scalars(
+                select(QueueItem).where(
+                    QueueItem.task_id == task.id,
+                    QueueItem.status.in_([QueueStatusEnum.failed, QueueStatusEnum.waiting]),
+                )
+            ).all()
             for row in rows:
                 row.status = QueueStatusEnum.pending
                 row.fail_reason = None
+                row.next_retry_at = None
             session.commit()
-            await query.message.reply_text("✅ 已将失败队列重置为待发布")
+            await query.message.reply_text("✅ 已将 failed/waiting 队列重置为待发布")
             return
         elif action == "task_import_hint":
             context.user_data["pending_input_action"] = "import_range"
@@ -2081,6 +2217,20 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         for task in tasks:
             exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == msg.message_id))
             if exists:
+                if exists.status in {QueueStatusEnum.waiting, QueueStatusEnum.failed}:
+                    exists.status = QueueStatusEnum.pending
+                    exists.fail_reason = None
+                    exists.next_retry_at = None
+                    exists.message_type = message_type
+                    exists.file_id = file_id
+                    exists.caption = msg.caption
+                    exists.text_preview = text_value[:280] if text_value else None
+                    exists.has_text = bool(text_value)
+                    exists.has_photo = bool(msg.photo)
+                    exists.has_video = bool(msg.video)
+                    exists.has_links = extract_links(text_value)
+                    exists.is_forwarded = bool(msg.forward_origin)
+                    exists.media_group_id = msg.media_group_id
                 continue
             session.add(
                 QueueItem(
@@ -2141,6 +2291,7 @@ async def post_init_hook(application: Application):
             BotCommand("task_status", "查看当前任务详情"),
             BotCommand("publish_now", "立即发布下一条"),
             BotCommand("retry_failed", "重试失败消息"),
+            BotCommand("retry_waiting", "重试等待消息"),
             BotCommand("restart", "重启流程（仅super）"),
         ]
     )
@@ -2178,6 +2329,11 @@ def init_db():
             conn.execute(sql_text("ALTER TABLE queue ADD COLUMN file_id VARCHAR(512)"))
         if "caption" not in columns:
             conn.execute(sql_text("ALTER TABLE queue ADD COLUMN caption TEXT"))
+        if "retry_count" not in columns:
+            conn.execute(sql_text("ALTER TABLE queue ADD COLUMN retry_count INTEGER DEFAULT 0"))
+            conn.execute(sql_text("UPDATE queue SET retry_count = 0 WHERE retry_count IS NULL"))
+        if "next_retry_at" not in columns:
+            conn.execute(sql_text("ALTER TABLE queue ADD COLUMN next_retry_at DATETIME"))
 
 
 def token_preview(token: str) -> str:
@@ -2225,6 +2381,7 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("publish_now", publish_now_cmd))
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("retry_failed", retry_failed_cmd))
+    app.add_handler(CommandHandler("retry_waiting", retry_waiting_cmd))
     app.add_handler(CommandHandler("set_interval", set_interval_cmd))
     app.add_handler(CommandHandler("set_daily_limit", set_daily_limit_cmd))
     app.add_handler(CommandHandler("set_time_window", set_time_window_cmd))
