@@ -130,6 +130,7 @@ class QueueItem(Base):
     has_text: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     has_photo: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     has_video: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    has_document: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     has_links: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     is_forwarded: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     media_group_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
@@ -158,6 +159,7 @@ class GlobalSetting(Base):
     __tablename__ = "global_settings"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     tick_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    debug_media_updates: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -179,10 +181,18 @@ class AppEnv:
     deploy_version: str
     startup_notify_chat_ids: list[int]
     restart_strategy: str
+    debug_media_updates: bool
 
 
 def parse_ids(raw: str) -> list[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def parse_bool_env(value: str, default: bool = False) -> bool:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 def normalize_database_url(value: str) -> str:
     raw = (value or "").strip()
@@ -205,6 +215,7 @@ def load_env() -> AppEnv:
         deploy_version=os.getenv("DEPLOY_VERSION", "").strip() or os.getenv("GIT_COMMIT", "").strip() or "unknown",
         startup_notify_chat_ids=parse_ids(os.getenv("STARTUP_NOTIFY_CHAT_IDS", "")),
         restart_strategy=os.getenv("RESTART_STRATEGY", "guide").strip().lower(),
+        debug_media_updates=parse_bool_env(os.getenv("DEBUG_MEDIA_UPDATES", ""), default=False),
     )
 
 
@@ -272,6 +283,52 @@ def extract_forward_chat_id(msg) -> Optional[int]:
     if legacy_chat and getattr(legacy_chat, "id", None) is not None:
         return legacy_chat.id
     return None
+
+
+def classify_update_message(update: Update) -> tuple[str, Optional[object]]:
+    if getattr(update, "message", None):
+        return "message", update.message
+    if getattr(update, "channel_post", None):
+        return "channel_post", update.channel_post
+    if getattr(update, "edited_message", None):
+        return "edited_message", update.edited_message
+    if getattr(update, "edited_channel_post", None):
+        return "edited_channel_post", update.edited_channel_post
+    return "other", None
+
+
+def log_debug_media_update(update_type: str, msg):
+    if not msg or not getattr(msg, "chat", None):
+        logger.info("debug_media_update type=%s no_message_payload", update_type)
+        return
+    has_photo = bool(getattr(msg, "photo", None))
+    has_video = bool(getattr(msg, "video", None))
+    has_document = bool(getattr(msg, "document", None))
+    caption = getattr(msg, "caption", None)
+    text = getattr(msg, "text", None)
+    photo_file_id = msg.photo[-1].file_id if has_photo and msg.photo else None
+    video_file_id = msg.video.file_id if has_video else None
+    document_file_id = msg.document.file_id if has_document else None
+    logger.info(
+        "debug_media_update type=%s chat_id=%s chat_type=%s message_id=%s media_group_id=%s has_photo=%s has_video=%s has_document=%s has_caption=%s has_text=%s photo_file_id=%s video_file_id=%s document_file_id=%s",
+        update_type,
+        msg.chat_id,
+        msg.chat.type,
+        msg.message_id,
+        msg.media_group_id,
+        has_photo,
+        has_video,
+        has_document,
+        bool(caption),
+        bool(text),
+        bool(photo_file_id),
+        bool(video_file_id),
+        bool(document_file_id),
+    )
+    if msg.media_group_id:
+        logger.info("media_group_detected chat_id=%s media_group_id=%s message_id=%s", msg.chat_id, msg.media_group_id, msg.message_id)
+    elif has_photo or has_video or has_document:
+        logger.info("single_media_or_group_missing chat_id=%s message_id=%s", msg.chat_id, msg.message_id)
 
 
 def require_admin(func):
@@ -967,6 +1024,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/set_delete_after_success on|off\n"
         "/set_auto_capture on|off\n"
         "/set_tick <seconds> (仅 super, 10-3600)\n"
+        "/debug_media on|off (仅 super, 媒体更新诊断)\n"
         "/restart (仅 super，触发重启流程)\n\n"
         "【过滤】(admin/super)\n"
         "/filters 查看过滤\n"
@@ -1349,6 +1407,27 @@ async def set_tick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.commit()
     scheduler.reschedule_job("publish_tick", trigger="interval", seconds=seconds)
     await update.message.reply_text(f"✅ tick_seconds={seconds}")
+
+
+@require_super
+async def debug_media_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.message.reply_text("用法: /debug_media on|off")
+        return
+    try:
+        enabled = parse_on_off(context.args[0], "debug_media")
+    except ValueError as exc:
+        await update.message.reply_text(f"参数错误：{exc}\n用法: /debug_media on|off")
+        return
+    with SessionLocal() as session:
+        setting = session.get(GlobalSetting, 1)
+        if not setting:
+            setting = GlobalSetting(id=1, tick_seconds=60, debug_media_updates=enabled)
+            session.add(setting)
+        else:
+            setting.debug_media_updates = enabled
+        session.commit()
+    await update.message.reply_text(f"✅ debug_media_updates={'on' if enabled else 'off'}")
 
 
 @require_super
@@ -2081,7 +2160,14 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @require_admin
 async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
+    update_type, typed_msg = classify_update_message(update)
+    with SessionLocal() as session:
+        debug_media = is_debug_media_enabled(session)
+    if debug_media:
+        logger.info("debug_update_type=%s", update_type)
+        if update_type in {"message", "channel_post", "edited_message", "edited_channel_post"}:
+            log_debug_media_update(update_type, typed_msg)
+    msg = typed_msg or update.effective_message
     if not msg or not msg.chat:
         return
     if msg.chat.type == "private" and msg.text:
@@ -2233,6 +2319,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     exists.has_text = bool(text_value)
                     exists.has_photo = bool(msg.photo)
                     exists.has_video = bool(msg.video)
+                    exists.has_document = bool(msg.document)
                     exists.has_links = extract_links(text_value)
                     exists.is_forwarded = bool(msg.forward_origin)
                     exists.media_group_id = msg.media_group_id
@@ -2249,6 +2336,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     has_text=bool(text_value),
                     has_photo=bool(msg.photo),
                     has_video=bool(msg.video),
+                    has_document=bool(msg.document),
                     has_links=extract_links(text_value),
                     is_forwarded=bool(msg.forward_origin),
                     media_group_id=msg.media_group_id,
@@ -2297,6 +2385,7 @@ async def post_init_hook(application: Application):
             BotCommand("publish_now", "立即发布下一条"),
             BotCommand("retry_failed", "重试失败消息"),
             BotCommand("retry_waiting", "重试等待消息"),
+            BotCommand("debug_media", "媒体更新诊断（仅super）"),
             BotCommand("restart", "重启流程（仅super）"),
         ]
     )
@@ -2356,12 +2445,19 @@ def init_db():
             conn.execute(sql_text("ALTER TABLE queue ADD COLUMN file_id VARCHAR(512)"))
         if "caption" not in columns:
             conn.execute(sql_text("ALTER TABLE queue ADD COLUMN caption TEXT"))
+        if "has_document" not in columns:
+            conn.execute(sql_text("ALTER TABLE queue ADD COLUMN has_document BOOLEAN"))
         if "retry_count" not in columns:
             conn.execute(sql_text("ALTER TABLE queue ADD COLUMN retry_count INTEGER DEFAULT 0"))
             conn.execute(sql_text("UPDATE queue SET retry_count = 0 WHERE retry_count IS NULL"))
         if "next_retry_at" not in columns:
             next_retry_type = "TIMESTAMP" if database_type(env.database_url) == "postgresql" else "DATETIME"
             conn.execute(sql_text(f"ALTER TABLE queue ADD COLUMN next_retry_at {next_retry_type}"))
+    gs_columns = {col["name"] for col in inspector.get_columns("global_settings")}
+    with engine.begin() as conn:
+        if "debug_media_updates" not in gs_columns:
+            conn.execute(sql_text("ALTER TABLE global_settings ADD COLUMN debug_media_updates BOOLEAN DEFAULT FALSE"))
+            conn.execute(sql_text("UPDATE global_settings SET debug_media_updates = FALSE WHERE debug_media_updates IS NULL"))
 
 
 def token_preview(token: str) -> str:
@@ -2377,6 +2473,12 @@ def database_type(database_url: str) -> str:
         return "postgresql"
     scheme = url.split(":", 1)[0] if ":" in url else ""
     return scheme or "unknown"
+
+
+def is_debug_media_enabled(session) -> bool:
+    setting = session.get(GlobalSetting, 1)
+    db_flag = bool(setting.debug_media_updates) if setting else False
+    return db_flag or bool(env.debug_media_updates)
 
 
 def startup_self_check():
@@ -2417,6 +2519,7 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("set_delete_after_success", set_delete_after_success_cmd))
     app.add_handler(CommandHandler("set_auto_capture", set_auto_capture_cmd))
     app.add_handler(CommandHandler("set_tick", set_tick_cmd))
+    app.add_handler(CommandHandler("debug_media", debug_media_cmd))
     app.add_handler(CommandHandler("restart", restart_cmd))
     app.add_handler(CommandHandler("start_task", start_task_cmd))
     app.add_handler(CommandHandler("pause_task", pause_task_cmd))
@@ -2426,7 +2529,10 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("remove_admin", remove_admin_cmd))
     app.add_handler(CommandHandler("admins", admins_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), capture_new_message))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & (~filters.COMMAND), capture_new_message))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & (~filters.COMMAND), capture_new_message))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & (~filters.COMMAND), capture_new_message))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST & (~filters.COMMAND), capture_new_message))
 
 
 def main():

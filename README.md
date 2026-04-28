@@ -134,3 +134,16 @@ pytest
 7. `/import_range 100 120`
 8. `/publish_now`
 9. `/start_task`
+
+## 12. 媒体组诊断（DEBUG）
+
+当你怀疑“相册被拆分发送”时，可开启媒体更新诊断：
+
+1. 超级管理员执行：`/debug_media on`
+2. 在源频道直接上传 2-3 张图片，并选择“作为相册发送”
+3. 查看日志：
+   - 若出现 `media_group_detected`，说明机器人收到了媒体组标识
+   - 若只有 `single_media_or_group_missing`，说明该条更新没有媒体组标识
+4. 若日志没有 `channel_post` 类型，说明机器人未收到频道更新或监听未覆盖频道更新
+5. 若有 `channel_post` 但 `media_group_id=None`，说明 Telegram 侧并非以相册方式送达
+6. 诊断完成后执行：`/debug_media off`

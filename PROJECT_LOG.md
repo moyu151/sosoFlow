@@ -59,8 +59,19 @@
   - 现象：查询 `queue.status='waiting'` 时抛异常，导致任务详情打不开
   - 根因：旧库中 `queue.status` 的枚举类型未包含新值 `waiting`
   - 处理：`init_db` 在 PostgreSQL 启动时执行枚举自迁移，自动为现有状态枚举追加 `waiting`（`ADD VALUE IF NOT EXISTS`）
+- 新增“原始更新诊断”能力（定位 `media_group_id=None`）：
+  - 新增环境变量开关：`DEBUG_MEDIA_UPDATES`（默认 `false`）
+  - 新增 super 命令：`/debug_media on|off`，写入 `global_settings.debug_media_updates`
+  - 诊断开启时输出 update 类型：`message/channel_post/edited_message/edited_channel_post`
+  - 对 message/channel_post 输出关键字段：`chat_id/chat_type/message_id/media_group_id/has_photo/has_video/has_document/caption/text/file_id`
+  - 检测到媒体组时输出：`media_group_detected ...`
+  - photo/video/document 但无媒体组时输出：`single_media_or_group_missing ...`
+  - 监听 handler 显式覆盖 `message/channel_post/edited_message/edited_channel_post`
+  - 新增 `queue.has_document` 字段并补充旧库 `ALTER TABLE`
+  - `README` 增加媒体组诊断步骤说明
 - 本轮改动文件：
   - `main.py`
+  - `README.md`
   - `README.md`
   - `requirements.txt`
   - `PROJECT_LOG.md`
