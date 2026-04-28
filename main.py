@@ -353,8 +353,8 @@ def build_task_detail_text(session, task: Task) -> str:
         f"🧩 任务详情\n"
         f"ID: {task.id}\n"
         f"名称: {task.name}\n"
-        f"源: `{task.source_chat_id}`\n"
-        f"目标: `{task.target_chat_id}`\n"
+        f"源: {task.source_chat_id}\n"
+        f"目标: {task.target_chat_id}\n"
         f"模式: {task.mode.value}\n"
         f"状态: {'🟢运行中' if task.enabled else '⏸暂停'}\n"
         f"pending: {stats['pending']} | published: {stats['published']} | failed: {stats['failed']} | skipped: {stats['skipped']}\n"
@@ -652,18 +652,19 @@ def build_tasks_list_keyboard(tasks: list[Task], page: int):
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "欢迎使用 sosoFlow 🚚\n\n"
-        "常用操作：\n"
-        "1) 任务列表：查看并进入任务详情\n"
-        "2) 新建任务：按提示输入来源ID和目标ID\n"
-        "3) 搜索任务：按任务名或ID快速定位\n"
-        "4) 获取频道/群ID：把任意频道/群消息转发给我，我会自动回显ID"
+        "常用功能：\n"
+        "• 任务列表：查看并进入任务详情\n"
+        "• 新建任务：按提示输入来源ID和目标ID\n"
+        "• 获取频道/群ID：转发消息给我自动识别\n\n"
+        "提示：你也可以使用底部快捷面板操作。"
     )
     if update.message:
         if os.path.exists(COVER_IMAGE_PATH):
             with open(COVER_IMAGE_PATH, "rb") as photo:
-                await update.message.reply_photo(photo=photo)
-        await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard())
-        await update.message.reply_text("已启用底部快捷面板：任务列表 / 新建任务", reply_markup=quick_panel_keyboard())
+                await update.message.reply_photo(photo=photo, caption=welcome_text, reply_markup=main_menu_keyboard())
+        else:
+            await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard())
+        await update.message.reply_text("👇 底部快捷面板已启用", reply_markup=quick_panel_keyboard())
 
 
 @require_admin
@@ -810,7 +811,7 @@ async def task_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with SessionLocal() as session:
         db_task = session.get(Task, task.id)
-        await update.message.reply_text(build_task_detail_text(session, db_task), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(build_task_detail_text(session, db_task))
 
 
 @require_admin
@@ -1231,7 +1232,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as session:
             tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
         if not tasks:
-            await query.message.reply_text("暂无任务", reply_markup=simple_back_home_keyboard())
+            await query.message.reply_text("ℹ️ 暂无任务", reply_markup=simple_back_home_keyboard())
             return
         await query.edit_message_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
         return
@@ -1260,8 +1261,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "create_task_hint":
         context.user_data["pending_input_action"] = "create_task_source"
         await query.message.reply_text(
-            "请输入来源频道/群组ID\n示例：-1001111111111",
-            reply_markup=simple_back_home_keyboard(),
+            "✍️ 请输入来源频道/群组ID\n示例：-1001111111111",
         )
         return
     if data == "global_status":
@@ -1279,7 +1279,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "help_menu":
         await query.message.reply_text(
-            "可直接用按钮完成主要操作：\n"
+            "💡 可直接用按钮完成主要操作：\n"
             "1) 主菜单选任务列表/新建任务\n"
             "2) 按页面提示直接输入参数文本\n"
             "3) 各层级都可用“返回/主菜单”按钮返回",
@@ -1302,7 +1302,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("任务不存在")
             return
         if action == "task_view":
-            await query.edit_message_text(build_task_detail_text(session, task), parse_mode=ParseMode.MARKDOWN, reply_markup=task_detail_keyboard(task_id))
+            await query.edit_message_text(build_task_detail_text(session, task), reply_markup=task_detail_keyboard(task_id))
             return
         if action == "task_start":
             task.enabled = True
@@ -1507,22 +1507,22 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             source_chat_id = parse_int(text, "source_chat_id")
         except ValueError as exc:
-            await msg.reply_text(f"参数错误：{exc}\n请重新输入来源频道/群组ID")
+            await msg.reply_text(f"⚠️ 参数错误：{exc}\n请重新输入来源频道/群组ID")
             return True
         context.user_data["pending_task_source_chat_id"] = source_chat_id
         context.user_data["pending_input_action"] = "create_task_target"
-        await msg.reply_text("请输入目标频道/群组ID\n示例：-1002222222222", reply_markup=simple_back_home_keyboard())
+        await msg.reply_text("✍️ 请输入目标频道/群组ID\n示例：-1002222222222")
         return True
     if action == "create_task_target":
         source_chat_id = context.user_data.get("pending_task_source_chat_id")
         if source_chat_id is None:
             context.user_data.pop("pending_input_action", None)
-            await msg.reply_text("创建流程已失效，请重新点击“➕ 新建任务”。")
+            await msg.reply_text("⚠️ 创建流程已失效，请重新点击“➕ 新建任务”。")
             return True
         try:
             target_chat_id = parse_int(text, "target_chat_id")
         except ValueError as exc:
-            await msg.reply_text(f"参数错误：{exc}\n请重新输入目标频道/群组ID")
+            await msg.reply_text(f"⚠️ 参数错误：{exc}\n请重新输入目标频道/群组ID")
             return True
         task_name = f"task_{abs(source_chat_id)}_{abs(target_chat_id)}"
         with SessionLocal() as session:
@@ -1713,14 +1713,14 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             with SessionLocal() as session:
                 tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
             if not tasks:
-                await msg.reply_text("暂无任务", reply_markup=simple_back_home_keyboard())
+                await msg.reply_text("ℹ️ 暂无任务", reply_markup=simple_back_home_keyboard())
             else:
                 await msg.reply_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
             return
-        if text == "➕ 新建任务":
-            context.user_data["pending_input_action"] = "create_task_source"
-            await msg.reply_text("请输入来源频道/群组ID\n示例：-1001111111111", reply_markup=simple_back_home_keyboard())
-            return
+            if text == "➕ 新建任务":
+                context.user_data["pending_input_action"] = "create_task_source"
+                await msg.reply_text("✍️ 请输入来源频道/群组ID\n示例：-1001111111111")
+                return
     forward_chat_id = None
     if msg.forward_origin and getattr(msg.forward_origin, "chat", None):
         forward_chat_id = msg.forward_origin.chat.id

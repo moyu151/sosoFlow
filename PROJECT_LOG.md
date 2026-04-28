@@ -97,6 +97,15 @@
   - `/start` 时弹出底部按钮：`📋 任务列表`、`➕ 新建任务`
   - 点击底部“任务列表”直接打开任务列表
   - 点击底部“新建任务”直接进入分步输入流程（来源ID -> 目标ID）
+- `/start` 展示样式优化：
+  - 改为单条 `photo + caption + InlineKeyboard`，避免图片和文字分裂成两条气泡
+  - 欢迎文案精简为要点式说明，增强“图文卡片”观感
+- 提示文案规范优化：
+  - “新建任务”输入引导改为纯文字提示，不再附带消息按钮
+  - 单独文字提醒前统一增加醒目 emoji（如 `✍️/⚠️/ℹ️/💡`），提升视觉注意力
+- 任务详情渲染稳定性修复：
+  - 去除任务详情中的 Markdown 解析依赖，改为纯文本渲染
+  - 避免任务名等字段包含 Markdown 特殊字符时导致“任务详情无法显示”
 
 ### 当前状态
 
@@ -126,6 +135,9 @@
 - 本轮命令菜单功能后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮主菜单微调后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮底部快捷面板后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮 `/start` 样式优化后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮提示文案规范优化后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮任务详情修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 
 ### 下一步建议（最高优先）
 
