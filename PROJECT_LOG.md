@@ -14,6 +14,10 @@
   - `DATABASE_URL` 兼容 `postgres://` 自动替换为 `postgresql://`
   - 启动自检日志新增 `Database Type: sqlite/postgresql`
   - `README.md` 补充 Neon 推荐 `DATABASE_URL` 示例（含 `sslmode=require`）
+- 修复 PostgreSQL（Neon）`integer out of range`：
+  - 将 Telegram ID 相关字段统一改为 `BigInteger`（仅模型字段类型变更，不改业务逻辑）
+  - 涉及字段：`admins.telegram_user_id`、`tasks.source_chat_id`、`tasks.target_chat_id`、`queue.message_id`、`queue.target_message_id`、`publish_logs.source_message_id`、`publish_logs.target_message_id`
+  - 自动建表策略保持不变：新库 `create_all` 正常建表；已存在表不做强制迁移
 - 本轮改动文件：
   - `main.py`
   - `README.md`

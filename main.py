@@ -22,6 +22,7 @@ from telegram.ext import (
     filters,
 )
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Enum as SqlEnum,
@@ -68,7 +69,7 @@ class QueueStatusEnum(str, Enum):
 class Admin(Base):
     __tablename__ = "admins"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     role: Mapped[RoleEnum] = mapped_column(SqlEnum(RoleEnum))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
@@ -77,8 +78,8 @@ class Task(Base):
     __tablename__ = "tasks"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
-    source_chat_id: Mapped[int] = mapped_column(Integer, index=True)
-    target_chat_id: Mapped[int] = mapped_column(Integer)
+    source_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    target_chat_id: Mapped[int] = mapped_column(BigInteger)
     mode: Mapped[TaskModeEnum] = mapped_column(SqlEnum(TaskModeEnum), default=TaskModeEnum.copy)
     interval_seconds: Mapped[int] = mapped_column(Integer, default=1800)
     daily_limit: Mapped[int] = mapped_column(Integer, default=100)
@@ -117,9 +118,9 @@ class QueueItem(Base):
     __table_args__ = (UniqueConstraint("task_id", "message_id", name="uq_task_msg"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
-    message_id: Mapped[int] = mapped_column(Integer)
+    message_id: Mapped[int] = mapped_column(BigInteger)
     status: Mapped[QueueStatusEnum] = mapped_column(SqlEnum(QueueStatusEnum), default=QueueStatusEnum.pending)
-    target_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    target_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     message_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     file_id: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -142,8 +143,8 @@ class PublishLog(Base):
     __tablename__ = "publish_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[int] = mapped_column(Integer, index=True)
-    source_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    target_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    source_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    target_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     action: Mapped[str] = mapped_column(String(20))
     message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
