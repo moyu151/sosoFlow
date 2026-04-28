@@ -253,6 +253,20 @@ def parse_on_off(value: str, field_name: str) -> bool:
         raise ValueError(f"{field_name} 仅支持 on/off")
     return normalized == "on"
 
+def extract_forward_chat_id(msg) -> Optional[int]:
+    origin = getattr(msg, "forward_origin", None)
+    if origin:
+        origin_chat = getattr(origin, "chat", None)
+        if origin_chat and getattr(origin_chat, "id", None) is not None:
+            return origin_chat.id
+        sender_chat = getattr(origin, "sender_chat", None)
+        if sender_chat and getattr(sender_chat, "id", None) is not None:
+            return sender_chat.id
+    legacy_chat = getattr(msg, "forward_from_chat", None)
+    if legacy_chat and getattr(legacy_chat, "id", None) is not None:
+        return legacy_chat.id
+    return None
+
 
 def require_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -772,6 +786,16 @@ def simple_back_home_keyboard():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🏠 主菜单", callback_data="menu_home"), InlineKeyboardButton("📋 任务列表", callback_data="tasks_list")]]
     )
+
+
+async def edit_query_message_text_or_caption(query, text: str, reply_markup=None):
+    message = query.message
+    if not message:
+        return
+    if getattr(message, "photo", None) or getattr(message, "video", None) or getattr(message, "document", None):
+        await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+        return
+    await query.edit_message_text(text, reply_markup=reply_markup)
 
 
 def build_tasks_list_keyboard(tasks: list[Task], page: int):
@@ -1353,14 +1377,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not tasks:
             await query.message.reply_text("ℹ️ 暂无任务")
             return
-        await query.edit_message_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
+        await edit_query_message_text_or_caption(query, "📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
         return
     if data == "task_search_hint":
         context.user_data["pending_input_action"] = "search_task"
         await query.message.reply_text("✍️ 请输入任务关键词（任务名或任务ID）")
         return
     if data == "menu_home":
-        await query.edit_message_text(main_menu_text(), reply_markup=main_menu_keyboard())
+        await edit_query_message_text_or_caption(query, main_menu_text(), reply_markup=main_menu_keyboard())
         return
     if data == "noop":
         return
@@ -1373,9 +1397,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as session:
             tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
         if not tasks:
-            await query.edit_message_text("暂无任务")
+            await edit_query_message_text_or_caption(query, "暂无任务")
             return
-        await query.edit_message_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=page))
+        await edit_query_message_text_or_caption(query, "📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=page))
         return
     if data == "create_task_hint":
         context.user_data["pending_input_action"] = "create_task_source"
@@ -1609,12 +1633,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     msg = update.effective_message
-    if not msg or not msg.text:
+    if not msg:
         return False
     if msg.chat and msg.chat.type != "private":
         return False
     action = context.user_data.get("pending_input_action")
     if not action:
+        return False
+    if msg.text:
+        quick_text = msg.text.strip()
+        if quick_text in {"📋 任务列表", "➕ 新建任务"}:
+            return False
+    # 允许“转发自动识别ID”优先于文本解析，避免转发消息在等待输入时被误判为参数错误
+    if action in {"create_task_source", "create_task_target", "edit_task_source", "edit_task_target"}:
+        if extract_forward_chat_id(msg) is not None:
+            return False
+    if not msg.text:
         return False
     text = msg.text.strip()
     if action == "create_task_source":
@@ -1906,12 +1940,13 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = update.effective_message
     if not msg or not msg.chat:
         return
-    handled = await handle_pending_input(update, context)
-    if handled:
-        return
     if msg.chat.type == "private" and msg.text:
         text = msg.text.strip()
         if text == "📋 任务列表":
+            context.user_data.pop("pending_input_action", None)
+            context.user_data.pop("pending_task_id", None)
+            context.user_data.pop("pending_task_source_chat_id", None)
+            context.user_data.pop("pending_window_start", None)
             with SessionLocal() as session:
                 tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
             if not tasks:
@@ -1920,14 +1955,16 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await msg.reply_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
             return
         if text == "➕ 新建任务":
+            context.user_data.pop("pending_task_id", None)
+            context.user_data.pop("pending_task_source_chat_id", None)
+            context.user_data.pop("pending_window_start", None)
             context.user_data["pending_input_action"] = "create_task_source"
             await msg.reply_text("✍️ 请输入来源频道/群组ID\n示例：-1001111111111\n💡 可转发来源频道/群消息给机器人，点击识别出的数字复制后发送确认。")
             return
-    forward_chat_id = None
-    if msg.forward_origin and getattr(msg.forward_origin, "chat", None):
-        forward_chat_id = msg.forward_origin.chat.id
-    elif getattr(msg, "forward_from_chat", None):
-        forward_chat_id = msg.forward_from_chat.id
+    handled = await handle_pending_input(update, context)
+    if handled:
+        return
+    forward_chat_id = extract_forward_chat_id(msg)
     if forward_chat_id is not None:
         if context.user_data.get("pending_input_action") == "create_task_source":
             context.user_data["pending_task_source_chat_id"] = forward_chat_id

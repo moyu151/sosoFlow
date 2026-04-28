@@ -2,6 +2,7 @@ from datetime import time
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ os.environ.setdefault("BOT_TOKEN", "test-token")
 from main import (
     TaskFilter,
     apply_filters,
+    extract_forward_chat_id,
     is_time_in_window,
     parse_hhmm,
     parse_int,
@@ -130,3 +132,13 @@ def test_album_like_caption_present_or_absent():
     without_caption = DummyQueueItem(has_text=False, has_photo=True, has_video=False, has_links=False, message_type="photo", text_preview="")
     assert apply_filters(with_caption, task_filter) is None
     assert apply_filters(without_caption, task_filter) == "文字过短"
+
+
+def test_extract_forward_chat_id_from_origin_chat():
+    message = SimpleNamespace(forward_origin=SimpleNamespace(chat=SimpleNamespace(id=-1001112223334)))
+    assert extract_forward_chat_id(message) == -1001112223334
+
+
+def test_extract_forward_chat_id_from_legacy_chat():
+    message = SimpleNamespace(forward_origin=None, forward_from_chat=SimpleNamespace(id=-1004445556667))
+    assert extract_forward_chat_id(message) == -1004445556667

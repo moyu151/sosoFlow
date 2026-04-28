@@ -18,11 +18,21 @@
   - 将 Telegram ID 相关字段统一改为 `BigInteger`（仅模型字段类型变更，不改业务逻辑）
   - 涉及字段：`admins.telegram_user_id`、`tasks.source_chat_id`、`tasks.target_chat_id`、`queue.message_id`、`queue.target_message_id`、`publish_logs.source_message_id`、`publish_logs.target_message_id`
   - 自动建表策略保持不变：新库 `create_all` 正常建表；已存在表不做强制迁移
+- 修复“新建任务时转发目标频道/群组消息无效”：
+  - 新增 `extract_forward_chat_id`，统一兼容 `forward_origin.chat` / `forward_origin.sender_chat` / `forward_from_chat`
+  - 在等待 `create_task_source/create_task_target/edit_task_source/edit_task_target` 输入时，若检测到转发消息，优先走“转发自动识别ID”分支，不再被文本参数校验提前拦截
+  - 新增纯函数测试覆盖转发 ID 提取链路（origin 与 legacy 两条路径）
+- 修复“输入ID/任务列表偶发无响应”：
+  - 新增 `edit_query_message_text_or_caption`，在主菜单为 `photo+caption` 场景下，按钮回调改用 `edit_message_caption`，避免 `edit_message_text` 失败导致无响应
+  - `tasks_list` / `tasks_page` / `menu_home` 回调统一使用上述安全编辑方法
+  - 私聊快捷入口“📋 任务列表/➕ 新建任务”改为优先处理，并清理残留 `pending_input_action` 相关状态，避免输入流程卡住
+  - 等待输入状态下，若收到上述快捷文本，放行到快捷入口，不再被参数解析分支拦截
 - 本轮改动文件：
   - `main.py`
   - `README.md`
   - `requirements.txt`
   - `PROJECT_LOG.md`
+  - `tests/test_core.py`
 
 ### 已验证项
 
