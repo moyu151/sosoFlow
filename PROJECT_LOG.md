@@ -117,6 +117,30 @@
 
 - `python -m py_compile main.py` 通过
 - `pytest` 通过（22 passed）
+- 本次“导入范围阻塞新帖”修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（35 passed）
+- 本次“媒体组占位补全”修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（36 passed）
+
+### 增量更新（本次）
+
+- 修复“/import_range 大范围占位ID阻塞新帖及时发布”：
+  - 根因：发布选择始终按最小 `message_id` 取 `pending`，会优先消耗 `message_type=unknown` 的历史占位项
+  - 处理：`pick_next_publish_item` 增加优先级，先选“实时捕获项（`message_type != unknown`）”，再回退占位项
+  - 效果：当源频道出现新帖并被自动入队后，不会再长期卡在历史空号前面
+- 新增回归测试：
+  - `tests/test_publish_unit_arch.py` 增加 `test_pick_next_publish_item_prioritize_realtime_over_unknown_import`
+  - 验证“unknown 占位 + realtime 消息并存时，优先选 realtime”
+- 修复“/import_range 占位导致 media_group_id 无法补全，后续相册仍被拆发”：
+  - 根因：同一 `task_id + message_id` 已存在且为 `pending` 时，监听链路不会刷新元数据，导致 `media_group_id/file_id/message_type` 长期停留在 `unknown/None`
+  - 处理：新增 `upsert_queue_item_from_capture`，对非终态（`pending/waiting/failed`）统一补全最新元数据；`waiting/failed` 仍会恢复为 `pending`
+  - 终态保护：`published/skipped` 不覆盖，避免污染历史结果
+  - 效果：占位消息在真实帖子到来后可自动“水合”为真实媒体项，媒体组可恢复按组发布
+- 新增回归测试：
+  - `tests/test_media_group_publish.py` 增加 `test_import_placeholder_pending_can_be_hydrated_then_publish_as_album`
+  - 验证“占位 pending 被补全后，发布路径走 `send_media_group` 而非拆发”
+
+### 下一步建议（最高优先）
+
+- 为任务详情补充“最近发布日志预览（最近5条）”按钮，并沿用“界面保持+单独提示”交互规则。
 
 ### 下一步建议（最高优先）
 

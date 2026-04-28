@@ -21,6 +21,7 @@ from main import (  # noqa: E402
     Task,
     TaskModeEnum,
     now,
+    pick_next_publish_item,
     publish_one,
 )
 
@@ -184,3 +185,28 @@ async def test_single_message_publish_unchanged():
     assert "发布成功 message_id=51" in result
     assert app.bot.send_media_group_calls == 0
 
+
+def test_pick_next_publish_item_prioritize_realtime_over_unknown_import():
+    task_id = _mk_task()
+    with main.SessionLocal() as session:
+        session.add(
+            QueueItem(
+                task_id=task_id,
+                message_id=50,
+                status=QueueStatusEnum.pending,
+                message_type="unknown",
+            )
+        )
+        session.add(
+            QueueItem(
+                task_id=task_id,
+                message_id=120,
+                status=QueueStatusEnum.pending,
+                message_type="text",
+                has_text=True,
+            )
+        )
+        session.commit()
+        picked = pick_next_publish_item(session, task_id)
+        assert picked is not None
+        assert picked.message_id == 120

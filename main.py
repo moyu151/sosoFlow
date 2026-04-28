@@ -739,6 +739,16 @@ def mark_item_waiting_or_failed(session, db_task: Task, queue_item: QueueItem, f
 
 
 def pick_next_publish_item(session, task_id: int) -> Optional[QueueItem]:
+    # 优先发布实时捕获的消息（有元数据），避免 /import_range 大范围占位ID阻塞新消息。
+    pending_item = session.scalar(
+        select(QueueItem).where(
+            QueueItem.task_id == task_id,
+            QueueItem.status == QueueStatusEnum.pending,
+            QueueItem.message_type != "unknown",
+        ).order_by(QueueItem.message_id.asc())
+    )
+    if pending_item:
+        return pending_item
     pending_item = session.scalar(
         select(QueueItem).where(QueueItem.task_id == task_id, QueueItem.status == QueueStatusEnum.pending).order_by(QueueItem.message_id.asc())
     )
@@ -763,6 +773,62 @@ def add_bot_to_chat_keyboard(application: Application) -> Optional[InlineKeyboar
             [InlineKeyboardButton("➕ 将机器人添加到群组", url=f"https://t.me/{bot_user}?startgroup=1")],
             [InlineKeyboardButton("📘 添加到频道说明", callback_data="help_menu")],
         ]
+    )
+
+
+def upsert_queue_item_from_capture(
+    session,
+    task_id: int,
+    message_id: int,
+    message_type: str,
+    file_id: Optional[str],
+    caption: Optional[str],
+    text_value: str,
+    has_photo: bool,
+    has_video: bool,
+    has_document: bool,
+    is_forwarded: bool,
+    media_group_id: Optional[str],
+):
+    exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task_id, QueueItem.message_id == message_id))
+    if exists:
+        # published/skipped 视为终态，不再覆盖，避免历史记录被新更新污染。
+        if exists.status in {QueueStatusEnum.published, QueueStatusEnum.skipped}:
+            return
+        if exists.status in {QueueStatusEnum.waiting, QueueStatusEnum.failed}:
+            exists.status = QueueStatusEnum.pending
+            exists.fail_reason = None
+            exists.next_retry_at = None
+        # 关键修复：pending 占位项也要被真实更新“补全元数据”，否则 media_group_id/file_id 会长期缺失。
+        exists.message_type = message_type
+        exists.file_id = file_id
+        exists.caption = caption
+        exists.text_preview = text_value[:280] if text_value else None
+        exists.has_text = bool(text_value)
+        exists.has_photo = has_photo
+        exists.has_video = has_video
+        exists.has_document = has_document
+        exists.has_links = extract_links(text_value)
+        exists.is_forwarded = is_forwarded
+        exists.media_group_id = media_group_id
+        return
+    session.add(
+        QueueItem(
+            task_id=task_id,
+            message_id=message_id,
+            status=QueueStatusEnum.pending,
+            message_type=message_type,
+            file_id=file_id,
+            caption=caption,
+            text_preview=text_value[:280] if text_value else None,
+            has_text=bool(text_value),
+            has_photo=has_photo,
+            has_video=has_video,
+            has_document=has_document,
+            has_links=extract_links(text_value),
+            is_forwarded=is_forwarded,
+            media_group_id=media_group_id,
+        )
     )
 
 
@@ -2381,6 +2447,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data.pop("pending_task_id", None)
             context.user_data.pop("pending_task_source_chat_id", None)
             context.user_data.pop("pending_window_start", None)
+            context.user_data.pop("pending_forward_media_group_id", None)
             with SessionLocal() as session:
                 tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
             if not tasks:
@@ -2392,6 +2459,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data.pop("pending_task_id", None)
             context.user_data.pop("pending_task_source_chat_id", None)
             context.user_data.pop("pending_window_start", None)
+            context.user_data.pop("pending_forward_media_group_id", None)
             context.user_data["pending_input_action"] = "create_task_source"
             await msg.reply_text("✍️ 请输入来源频道/群组ID\n示例：-1001111111111\n💡 可转发来源频道/群消息给机器人，点击识别出的数字复制后发送确认。")
             return
@@ -2400,6 +2468,12 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     forward_chat_id = extract_forward_chat_id(msg)
     if forward_chat_id is not None:
+        pending_action = context.user_data.get("pending_input_action")
+        if pending_action in {"create_task_source", "create_task_target", "edit_task_source", "edit_task_target"} and msg.media_group_id:
+            last_group_id = context.user_data.get("pending_forward_media_group_id")
+            if last_group_id == msg.media_group_id:
+                return
+            context.user_data["pending_forward_media_group_id"] = msg.media_group_id
         if context.user_data.get("pending_input_action") == "create_task_source":
             context.user_data["pending_task_source_chat_id"] = forward_chat_id
             context.user_data["pending_input_action"] = "create_task_target"
@@ -2434,6 +2508,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data.pop("pending_input_action", None)
             context.user_data.pop("pending_task_source_chat_id", None)
             context.user_data.pop("last_same_pair_warn_key", None)
+            context.user_data.pop("pending_forward_media_group_id", None)
             if created:
                 await msg.reply_text(
                     f"✅ 已自动确认目标ID并创建任务\nID={task.id}\n名称: {task.name}\n源: {source_chat_id}\n目标: {target_chat_id}",
@@ -2467,6 +2542,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             context.user_data.pop("pending_input_action", None)
             context.user_data.pop("pending_task_id", None)
+            context.user_data.pop("pending_forward_media_group_id", None)
             return
         if context.user_data.get("pending_input_action") == "edit_task_target":
             task_id = context.user_data.get("pending_task_id")
@@ -2490,6 +2566,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             context.user_data.pop("pending_input_action", None)
             context.user_data.pop("pending_task_id", None)
+            context.user_data.pop("pending_forward_media_group_id", None)
             return
         await msg.reply_text(
             f"📌 已识别转发来源ID：`{forward_chat_id}`\n"
@@ -2521,41 +2598,19 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     with SessionLocal() as session:
         tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id, Task.auto_capture_enabled.is_(True))).all()
         for task in tasks:
-            exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == msg.message_id))
-            if exists:
-                if exists.status in {QueueStatusEnum.waiting, QueueStatusEnum.failed}:
-                    exists.status = QueueStatusEnum.pending
-                    exists.fail_reason = None
-                    exists.next_retry_at = None
-                    exists.message_type = message_type
-                    exists.file_id = file_id
-                    exists.caption = msg.caption
-                    exists.text_preview = text_value[:280] if text_value else None
-                    exists.has_text = bool(text_value)
-                    exists.has_photo = bool(msg.photo)
-                    exists.has_video = bool(msg.video)
-                    exists.has_document = bool(msg.document)
-                    exists.has_links = extract_links(text_value)
-                    exists.is_forwarded = bool(msg.forward_origin)
-                    exists.media_group_id = msg.media_group_id
-                continue
-            session.add(
-                QueueItem(
-                    task_id=task.id,
-                    message_id=msg.message_id,
-                    status=QueueStatusEnum.pending,
-                    message_type=message_type,
-                    file_id=file_id,
-                    caption=msg.caption,
-                    text_preview=text_value[:280] if text_value else None,
-                    has_text=bool(text_value),
-                    has_photo=bool(msg.photo),
-                    has_video=bool(msg.video),
-                    has_document=bool(msg.document),
-                    has_links=extract_links(text_value),
-                    is_forwarded=bool(msg.forward_origin),
-                    media_group_id=msg.media_group_id,
-                )
+            upsert_queue_item_from_capture(
+                session=session,
+                task_id=task.id,
+                message_id=msg.message_id,
+                message_type=message_type,
+                file_id=file_id,
+                caption=msg.caption,
+                text_value=text_value,
+                has_photo=bool(msg.photo),
+                has_video=bool(msg.video),
+                has_document=bool(msg.document),
+                is_forwarded=bool(msg.forward_origin),
+                media_group_id=msg.media_group_id,
             )
         session.commit()
 
