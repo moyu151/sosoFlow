@@ -82,6 +82,21 @@
   - 新增 `/restart`（仅 super）安全重启流程，支持 `guide|exit|exec` 策略
   - 新增环境变量：`DEPLOY_VERSION`、`STARTUP_NOTIFY_CHAT_IDS`、`RESTART_STRATEGY`
   - README 与 `.env.example` 已同步更新说明
+- 交互修复与引导增强：
+  - `/start` 增加封面图（`img/b.png`）和常用操作文字引导
+  - 修复“任务列表”在无任务时导致原面板消失的问题（改为单独提示 + 返回按钮）
+  - “新建任务”改为分步输入：先输入来源ID，再输入目标ID，不再要求输入命令格式
+  - 新增“转发消息自动识别频道/群ID”并回显，便于直接复制使用
+  - 补全帮助菜单说明，覆盖当前命令和便捷交互能力
+- 新增 Telegram 输入框左侧命令菜单（`setMyCommands`）：
+  - 启动时自动注册常用命令（start/help/status/tasks/task_status/publish_now/retry_failed/restart）
+- 主菜单微调：
+  - 隐藏“搜索任务”按钮（保留命令能力，不在主菜单展示）
+  - 在“帮助”左侧新增“📢 官方频道”按钮，链接 `https://t.me/sosoFlow`
+- 新增底部快捷面板（Reply Keyboard）：
+  - `/start` 时弹出底部按钮：`📋 任务列表`、`➕ 新建任务`
+  - 点击底部“任务列表”直接打开任务列表
+  - 点击底部“新建任务”直接进入分步输入流程（来源ID -> 目标ID）
 
 ### 当前状态
 
@@ -107,9 +122,14 @@
 - 重新验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮交互改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮部署/重启功能后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮交互修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮命令菜单功能后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮主菜单微调后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮底部快捷面板后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 
 ### 下一步建议（最高优先）
 
 - 为任务详情补充“最近发布日志预览（最近5条）”按钮，提升运维可见性。
 - 为任务详情补充“最近发布日志预览（最近5条）”按钮，提升运维可见性，并沿用“界面保持+单独提示”交互规则。
+- 为任务详情补充“最近发布日志预览（最近5条）”按钮，并沿用“界面保持+单独提示”交互规则。
 - 为任务详情补充“最近发布日志预览（最近5条）”按钮，并沿用“界面保持+单独提示”交互规则。

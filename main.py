@@ -10,7 +10,7 @@ from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -197,6 +197,7 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 scheduler = AsyncIOScheduler(timezone=env.tz)
 MAX_IMPORT_RANGE = 5000
 TASKS_PAGE_SIZE = 8
+COVER_IMAGE_PATH = os.path.join("img", "b.png")
 
 
 def parse_hhmm(value: str) -> time:
@@ -607,9 +608,18 @@ def main_menu_keyboard():
         [
             [InlineKeyboardButton("📋 任务列表", callback_data="tasks_list"), InlineKeyboardButton("➕ 新建任务", callback_data="create_task_hint")],
             [InlineKeyboardButton("📊 当前状态", callback_data="global_status"), InlineKeyboardButton("👤 管理员", callback_data="admins_list")],
-            [InlineKeyboardButton("🔎 搜索任务", callback_data="task_search_hint")],
-            [InlineKeyboardButton("❓ 帮助", callback_data="help_menu")],
+            [InlineKeyboardButton("📢 官方频道", url="https://t.me/sosoFlow"), InlineKeyboardButton("❓ 帮助", callback_data="help_menu")],
         ]
+    )
+
+
+def quick_panel_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📋 任务列表"), KeyboardButton("➕ 新建任务")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -640,7 +650,20 @@ def build_tasks_list_keyboard(tasks: list[Task], page: int):
 
 @require_admin
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("欢迎使用 sosoFlow 🚚", reply_markup=main_menu_keyboard())
+    welcome_text = (
+        "欢迎使用 sosoFlow 🚚\n\n"
+        "常用操作：\n"
+        "1) 任务列表：查看并进入任务详情\n"
+        "2) 新建任务：按提示输入来源ID和目标ID\n"
+        "3) 搜索任务：按任务名或ID快速定位\n"
+        "4) 获取频道/群ID：把任意频道/群消息转发给我，我会自动回显ID"
+    )
+    if update.message:
+        if os.path.exists(COVER_IMAGE_PATH):
+            with open(COVER_IMAGE_PATH, "rb") as photo:
+                await update.message.reply_photo(photo=photo)
+        await update.message.reply_text(welcome_text, reply_markup=main_menu_keyboard())
+        await update.message.reply_text("已启用底部快捷面板：任务列表 / 新建任务", reply_markup=quick_panel_keyboard())
 
 
 @require_admin
@@ -648,14 +671,20 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📘 sosoFlow 帮助\n\n"
         "【通用】(admin/super)\n"
-        "/start 主菜单\n/help 查看本帮助\n/status 系统状态\n\n"
+        "/start 主菜单（带封面）\n"
+        "/help 查看本帮助\n"
+        "/status 系统状态\n\n"
         "【任务】(admin/super)\n"
-        "/add_task <name> <source_chat_id> <target_chat_id>  例: /add_task test -1001 -1002\n"
-        "/tasks 查看任务列表\n/use_task <task_id> 选择当前任务\n/task_status 当前任务详情\n/delete_task <task_id> 删除(二次确认)\n\n"
+        "/add_task <name> <source_chat_id> <target_chat_id> 新建任务（命令方式）\n"
+        "/tasks 查看任务列表\n"
+        "/use_task <task_id> 选择当前任务\n"
+        "/task_status 当前任务详情\n"
+        "/delete_task <task_id> 删除(二次确认)\n\n"
         "【队列】(admin/super)\n"
         f"/import_range <start_message_id> <end_message_id> (单次最多 {MAX_IMPORT_RANGE})\n"
         "/publish_now 立即发布下一条 pending（忽略时间窗与间隔）\n"
-        "/skip <message_id> 跳过当前任务队列消息\n/retry_failed 重试 failed 消息\n\n"
+        "/skip <message_id> 跳过当前任务队列消息\n"
+        "/retry_failed 重试 failed 消息\n\n"
         "【设置】(admin/super)\n"
         "/set_interval <seconds> (必须 > 0)\n"
         "/set_round <hours> <limit> (hours>0, limit>=0)\n"
@@ -675,6 +704,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/admins 查看管理员(admin/super)\n"
         "/add_admin <telegram_user_id> (仅 super)\n"
         "/remove_admin <telegram_user_id> (仅 super)\n\n"
+        "【便捷功能】\n"
+        "按钮“新建任务”：分步输入 source_chat_id -> target_chat_id\n"
+        "转发任意频道/群消息给机器人：自动回显频道/群ID\n\n"
         "非管理员统一返回：无权限，请联系 @sosoFlow"
     )
     await update.message.reply_text(text)
@@ -1199,7 +1231,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as session:
             tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
         if not tasks:
-            await query.edit_message_text("暂无任务")
+            await query.message.reply_text("暂无任务", reply_markup=simple_back_home_keyboard())
             return
         await query.edit_message_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
         return
@@ -1226,9 +1258,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=page))
         return
     if data == "create_task_hint":
-        context.user_data["pending_input_action"] = "create_task"
+        context.user_data["pending_input_action"] = "create_task_source"
         await query.message.reply_text(
-            "请输入：<name> <source_chat_id> <target_chat_id>\n示例：test -1001111111111 -1002222222222",
+            "请输入来源频道/群组ID\n示例：-1001111111111",
             reply_markup=simple_back_home_keyboard(),
         )
         return
@@ -1471,20 +1503,30 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not action:
         return False
     text = msg.text.strip()
-    if action == "create_task":
-        parts = text.split()
-        if len(parts) != 3:
-            await msg.reply_text("格式错误，请输入：<name> <source_chat_id> <target_chat_id>")
+    if action == "create_task_source":
+        try:
+            source_chat_id = parse_int(text, "source_chat_id")
+        except ValueError as exc:
+            await msg.reply_text(f"参数错误：{exc}\n请重新输入来源频道/群组ID")
+            return True
+        context.user_data["pending_task_source_chat_id"] = source_chat_id
+        context.user_data["pending_input_action"] = "create_task_target"
+        await msg.reply_text("请输入目标频道/群组ID\n示例：-1002222222222", reply_markup=simple_back_home_keyboard())
+        return True
+    if action == "create_task_target":
+        source_chat_id = context.user_data.get("pending_task_source_chat_id")
+        if source_chat_id is None:
+            context.user_data.pop("pending_input_action", None)
+            await msg.reply_text("创建流程已失效，请重新点击“➕ 新建任务”。")
             return True
         try:
-            name = parts[0]
-            source_chat_id = parse_int(parts[1], "source_chat_id")
-            target_chat_id = parse_int(parts[2], "target_chat_id")
+            target_chat_id = parse_int(text, "target_chat_id")
         except ValueError as exc:
-            await msg.reply_text(f"参数错误：{exc}")
+            await msg.reply_text(f"参数错误：{exc}\n请重新输入目标频道/群组ID")
             return True
+        task_name = f"task_{abs(source_chat_id)}_{abs(target_chat_id)}"
         with SessionLocal() as session:
-            task = Task(name=name, source_chat_id=source_chat_id, target_chat_id=target_chat_id)
+            task = Task(name=task_name, source_chat_id=source_chat_id, target_chat_id=target_chat_id)
             session.add(task)
             session.commit()
             session.refresh(task)
@@ -1497,8 +1539,12 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 state.current_task_id = task.id
             session.commit()
             kb = task_detail_keyboard(task.id)
-            await msg.reply_text(f"✅ 任务创建成功并已选中\nID={task.id}\n{name}", reply_markup=kb)
+            await msg.reply_text(
+                f"✅ 任务创建成功并已选中\nID={task.id}\n名称: {task_name}\n源: {source_chat_id}\n目标: {target_chat_id}",
+                reply_markup=kb,
+            )
         context.user_data.pop("pending_input_action", None)
+        context.user_data.pop("pending_task_source_chat_id", None)
         return True
     if action == "search_task":
         keyword = text.strip()
@@ -1661,6 +1707,32 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     handled = await handle_pending_input(update, context)
     if handled:
         return
+    if msg.chat.type == "private" and msg.text:
+        text = msg.text.strip()
+        if text == "📋 任务列表":
+            with SessionLocal() as session:
+                tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
+            if not tasks:
+                await msg.reply_text("暂无任务", reply_markup=simple_back_home_keyboard())
+            else:
+                await msg.reply_text("📋 任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
+            return
+        if text == "➕ 新建任务":
+            context.user_data["pending_input_action"] = "create_task_source"
+            await msg.reply_text("请输入来源频道/群组ID\n示例：-1001111111111", reply_markup=simple_back_home_keyboard())
+            return
+    forward_chat_id = None
+    if msg.forward_origin and getattr(msg.forward_origin, "chat", None):
+        forward_chat_id = msg.forward_origin.chat.id
+    elif getattr(msg, "forward_from_chat", None):
+        forward_chat_id = msg.forward_from_chat.id
+    if forward_chat_id is not None:
+        await msg.reply_text(
+            f"📌 已识别转发来源ID：`{forward_chat_id}`\n"
+            "可直接用于新建任务的来源或目标ID。",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
     source_chat_id = msg.chat_id
     text_value = msg.text or msg.caption or ""
     message_type = "text"
@@ -1726,6 +1798,18 @@ async def notify_startup(application: Application):
 
 
 async def post_init_hook(application: Application):
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "打开主菜单"),
+            BotCommand("help", "查看完整帮助"),
+            BotCommand("status", "查看系统状态"),
+            BotCommand("tasks", "查看任务列表"),
+            BotCommand("task_status", "查看当前任务详情"),
+            BotCommand("publish_now", "立即发布下一条"),
+            BotCommand("retry_failed", "重试失败消息"),
+            BotCommand("restart", "重启流程（仅super）"),
+        ]
+    )
     await notify_startup(application)
 
 
