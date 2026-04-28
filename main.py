@@ -1,6 +1,8 @@
 import logging
 import os
 import re
+import sys
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import Enum
@@ -164,6 +166,9 @@ class AppEnv:
     admin_user_ids: list[int]
     database_url: str
     tz: str
+    deploy_version: str
+    startup_notify_chat_ids: list[int]
+    restart_strategy: str
 
 
 def parse_ids(raw: str) -> list[int]:
@@ -180,6 +185,9 @@ def load_env() -> AppEnv:
         admin_user_ids=parse_ids(os.getenv("ADMIN_USER_IDS", "")),
         database_url=os.getenv("DATABASE_URL", "sqlite:///data.db"),
         tz=os.getenv("TZ", "Asia/Shanghai"),
+        deploy_version=os.getenv("DEPLOY_VERSION", "").strip() or os.getenv("GIT_COMMIT", "").strip() or "unknown",
+        startup_notify_chat_ids=parse_ids(os.getenv("STARTUP_NOTIFY_CHAT_IDS", "")),
+        restart_strategy=os.getenv("RESTART_STRATEGY", "guide").strip().lower(),
     )
 
 
@@ -406,6 +414,7 @@ def task_settings_keyboard(task: Task):
                 InlineKeyboardButton("🔍 过滤设置", callback_data=f"task_filters:{task.id}"),
                 InlineKeyboardButton("⬅️ 返回任务详情", callback_data=f"task_view:{task.id}"),
             ],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
         ]
     )
 
@@ -443,6 +452,7 @@ def task_filters_keyboard(task_id: int, task_filter: TaskFilter):
                 InlineKeyboardButton("max=关闭", callback_data=f"task_filter_max_off:{task_id}"),
             ],
             [InlineKeyboardButton("⬅️ 返回任务设置", callback_data=f"task_settings:{task_id}")],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
         ]
     )
 
@@ -603,6 +613,12 @@ def main_menu_keyboard():
     )
 
 
+def simple_back_home_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 主菜单", callback_data="menu_home"), InlineKeyboardButton("📋 任务列表", callback_data="tasks_list")]]
+    )
+
+
 def build_tasks_list_keyboard(tasks: list[Task], page: int):
     total = len(tasks)
     max_page = max((total - 1) // TASKS_PAGE_SIZE, 0)
@@ -648,7 +664,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/set_mode copy|forward\n"
         "/set_delete_after_success on|off\n"
         "/set_auto_capture on|off\n"
-        "/set_tick <seconds> (仅 super, 10-3600)\n\n"
+        "/set_tick <seconds> (仅 super, 10-3600)\n"
+        "/restart (仅 super，触发重启流程)\n\n"
         "【过滤】(admin/super)\n"
         "/filters 查看过滤\n"
         "/set_filter <bool_key> on|off\n"
@@ -1025,6 +1042,36 @@ async def set_tick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ tick_seconds={seconds}")
 
 
+@require_super
+async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    strategy = env.restart_strategy
+    if strategy not in {"guide", "exit", "exec"}:
+        strategy = "guide"
+    await update.message.reply_text(
+        f"♻️ 收到重启请求\n策略: {strategy}\n"
+        "说明：重启机器人就是重启当前进程。"
+    )
+    if strategy == "guide":
+        await update.message.reply_text(
+            "当前为引导模式，不自动停进程。\n"
+            "请在部署平台执行 Restart/重启实例；重启成功后会自动收到启动通知。"
+        )
+        return
+    if strategy == "exit":
+        await update.message.reply_text("即将退出当前进程，请确认平台已配置自动拉起。")
+        asyncio.create_task(_delayed_restart_or_exit(exec_mode=False))
+        return
+    await update.message.reply_text("即将执行进程内重启（exec）。")
+    asyncio.create_task(_delayed_restart_or_exit(exec_mode=True))
+
+
+async def _delayed_restart_or_exit(exec_mode: bool):
+    await asyncio.sleep(1.0)
+    if exec_mode:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    raise SystemExit(0)
+
+
 @require_admin
 async def start_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = await set_current_task_simple(update, context, "enabled", True)
@@ -1158,7 +1205,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "task_search_hint":
         context.user_data["pending_input_action"] = "search_task"
-        await query.edit_message_text("请输入任务关键词（任务名或任务ID）")
+        await query.message.reply_text("请输入任务关键词（任务名或任务ID）", reply_markup=simple_back_home_keyboard())
         return
     if data == "menu_home":
         await query.edit_message_text("欢迎使用 sosoFlow 🚚", reply_markup=main_menu_keyboard())
@@ -1180,20 +1227,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "create_task_hint":
         context.user_data["pending_input_action"] = "create_task"
-        await query.edit_message_text("请输入：<name> <source_chat_id> <target_chat_id>\n示例：test -1001111111111 -1002222222222")
+        await query.message.reply_text(
+            "请输入：<name> <source_chat_id> <target_chat_id>\n示例：test -1001111111111 -1002222222222",
+            reply_markup=simple_back_home_keyboard(),
+        )
         return
     if data == "global_status":
         with SessionLocal() as session:
             task_count = session.scalar(select(func.count()).select_from(Task)) or 0
-        await query.edit_message_text(f"📊 当前任务总数: {task_count}")
+        await query.message.reply_text(f"📊 当前任务总数: {task_count}", reply_markup=simple_back_home_keyboard())
         return
     if data == "admins_list":
         with SessionLocal() as session:
             rows = session.scalars(select(Admin)).all()
-        await query.edit_message_text("👤 管理员\n" + "\n".join([f"{x.telegram_user_id} ({x.role.value})" for x in rows]))
+        await query.message.reply_text(
+            "👤 管理员\n" + "\n".join([f"{x.telegram_user_id} ({x.role.value})" for x in rows]),
+            reply_markup=simple_back_home_keyboard(),
+        )
         return
     if data == "help_menu":
-        await query.edit_message_text("请使用 /help 查看完整命令说明")
+        await query.message.reply_text(
+            "可直接用按钮完成主要操作：\n"
+            "1) 主菜单选任务列表/新建任务\n"
+            "2) 按页面提示直接输入参数文本\n"
+            "3) 各层级都可用“返回/主菜单”按钮返回",
+            reply_markup=simple_back_home_keyboard(),
+        )
         return
     if ":" not in data:
         return
@@ -1216,22 +1275,38 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "task_start":
             task.enabled = True
             session.commit()
+            await query.message.reply_text("✅ 已启动任务，当前界面保持不变。")
+            return
         elif action == "task_pause":
             task.enabled = False
             session.commit()
+            await query.message.reply_text("✅ 已暂停任务，当前界面保持不变。")
+            return
         elif action == "task_publish":
             result = await publish_one(context.application, task, ignore_interval=True, ignore_window=True)
             await query.message.reply_text(f"🚀 {result}")
+            return
         elif action == "task_retry":
             rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.failed)).all()
             for row in rows:
                 row.status = QueueStatusEnum.pending
                 row.fail_reason = None
             session.commit()
+            await query.message.reply_text("✅ 已将失败队列重置为 pending，当前界面保持不变。")
+            return
         elif action == "task_import_hint":
             context.user_data["pending_input_action"] = "import_range"
             context.user_data["pending_task_id"] = task.id
-            await query.message.reply_text(f"请发送导入范围：<start_message_id> <end_message_id>\n示例：100 120（单次最多 {MAX_IMPORT_RANGE}）")
+            await query.message.reply_text(
+                f"请发送导入范围：<start_message_id> <end_message_id>\n示例：100 120（单次最多 {MAX_IMPORT_RANGE}）",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("⬅️ 返回任务详情", callback_data=f"task_view:{task.id}")],
+                        [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
+                    ]
+                ),
+            )
+            return
         elif action == "task_settings":
             await query.edit_message_text(
                 f"⚙️ 任务设置（ID={task.id}）\n"
@@ -1247,17 +1322,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "task_toggle_mode":
             task.mode = TaskModeEnum.forward if task.mode == TaskModeEnum.copy else TaskModeEnum.copy
             session.commit()
-            await query.edit_message_text(f"✅ 模式已切换为 {task.mode.value}", reply_markup=task_settings_keyboard(task))
+            await query.edit_message_reply_markup(reply_markup=task_settings_keyboard(task))
+            await query.message.reply_text(f"✅ 模式已切换为 {task.mode.value}")
             return
         elif action == "task_toggle_auto_capture":
             task.auto_capture_enabled = not task.auto_capture_enabled
             session.commit()
-            await query.edit_message_text(f"✅ 自动监听已设为 {'on' if task.auto_capture_enabled else 'off'}", reply_markup=task_settings_keyboard(task))
+            await query.edit_message_reply_markup(reply_markup=task_settings_keyboard(task))
+            await query.message.reply_text(f"✅ 自动监听已设为 {'on' if task.auto_capture_enabled else 'off'}")
             return
         elif action == "task_toggle_delete":
             task.delete_after_success = not task.delete_after_success
             session.commit()
-            await query.edit_message_text(f"✅ 发布后删除源消息已设为 {'on' if task.delete_after_success else 'off'}", reply_markup=task_settings_keyboard(task))
+            await query.edit_message_reply_markup(reply_markup=task_settings_keyboard(task))
+            await query.message.reply_text(f"✅ 发布后删除源消息已设为 {'on' if task.delete_after_success else 'off'}")
             return
         elif action == "task_set_interval":
             if len(parts) != 3:
@@ -1266,7 +1344,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             interval = parse_int(parts[2], "interval_seconds")
             task.interval_seconds = interval
             session.commit()
-            await query.edit_message_text(f"✅ interval 已设为 {interval}s", reply_markup=task_settings_keyboard(task))
+            await query.message.reply_text(f"✅ interval 已设为 {interval}s，当前界面保持不变。")
             return
         elif action == "task_set_daily":
             if len(parts) != 3:
@@ -1275,7 +1353,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             daily_limit = parse_int(parts[2], "daily_limit")
             task.daily_limit = max(0, daily_limit)
             session.commit()
-            await query.edit_message_text(f"✅ daily_limit 已设为 {task.daily_limit}", reply_markup=task_settings_keyboard(task))
+            await query.message.reply_text(f"✅ daily_limit 已设为 {task.daily_limit}，当前界面保持不变。")
             return
         elif action == "task_set_window":
             if len(parts) != 4:
@@ -1290,22 +1368,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task.active_start_time = start_time
             task.active_end_time = end_time
             session.commit()
-            await query.edit_message_text(f"✅ time_window 已设为 {start_time}-{end_time}", reply_markup=task_settings_keyboard(task))
+            await query.message.reply_text(f"✅ time_window 已设为 {start_time}-{end_time}，当前界面保持不变。")
             return
         elif action == "task_input_interval":
             context.user_data["pending_input_action"] = "set_interval_custom"
             context.user_data["pending_task_id"] = task.id
-            await query.message.reply_text("请输入 interval_seconds（整数，>0）\n示例：1800")
+            await query.message.reply_text("请输入 interval_seconds（整数，>0）\n示例：1800", reply_markup=simple_back_home_keyboard())
             return
         elif action == "task_input_daily":
             context.user_data["pending_input_action"] = "set_daily_custom"
             context.user_data["pending_task_id"] = task.id
-            await query.message.reply_text("请输入 daily_limit（整数，>=0）\n示例：100")
+            await query.message.reply_text("请输入 daily_limit（整数，>=0）\n示例：100", reply_markup=simple_back_home_keyboard())
             return
         elif action == "task_input_window":
             context.user_data["pending_input_action"] = "set_window_custom"
             context.user_data["pending_task_id"] = task.id
-            await query.message.reply_text("请输入时间窗：<HH:MM> <HH:MM>\n示例：09:00 23:30")
+            await query.message.reply_text("请输入时间窗：<HH:MM> <HH:MM>\n示例：09:00 23:30", reply_markup=simple_back_home_keyboard())
             return
         elif action == "task_filters":
             task_filter = ensure_task_filter(session, task.id)
@@ -1335,10 +1413,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task_filter = ensure_task_filter(session, task.id)
             setattr(task_filter, key, not bool(getattr(task_filter, key)))
             session.commit()
-            await query.edit_message_text(
-                f"🔍 过滤设置（任务 {task.id}）\n{filter_summary(task_filter)}",
-                reply_markup=task_filters_keyboard(task.id, task_filter),
-            )
+            await query.edit_message_reply_markup(reply_markup=task_filters_keyboard(task.id, task_filter))
+            await query.message.reply_text(f"✅ 已更新过滤项：{key}")
             return
         elif action == "task_filter_min":
             if len(parts) != 3:
@@ -1347,10 +1423,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task_filter = ensure_task_filter(session, task.id)
             task_filter.min_text_length = parse_int(parts[2], "min_text_length")
             session.commit()
-            await query.edit_message_text(
-                f"✅ min_text_length={task_filter.min_text_length}\n{filter_summary(task_filter)}",
-                reply_markup=task_filters_keyboard(task.id, task_filter),
-            )
+            await query.message.reply_text(f"✅ min_text_length={task_filter.min_text_length}，当前界面保持不变。")
             return
         elif action == "task_filter_max":
             if len(parts) != 3:
@@ -1359,28 +1432,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task_filter = ensure_task_filter(session, task.id)
             task_filter.max_text_length = parse_int(parts[2], "max_text_length")
             session.commit()
-            await query.edit_message_text(
-                f"✅ max_text_length={task_filter.max_text_length}\n{filter_summary(task_filter)}",
-                reply_markup=task_filters_keyboard(task.id, task_filter),
-            )
+            await query.message.reply_text(f"✅ max_text_length={task_filter.max_text_length}，当前界面保持不变。")
             return
         elif action == "task_filter_min_off":
             task_filter = ensure_task_filter(session, task.id)
             task_filter.min_text_length = None
             session.commit()
-            await query.edit_message_text(
-                f"✅ min_text_length 已关闭\n{filter_summary(task_filter)}",
-                reply_markup=task_filters_keyboard(task.id, task_filter),
-            )
+            await query.message.reply_text("✅ min_text_length 已关闭，当前界面保持不变。")
             return
         elif action == "task_filter_max_off":
             task_filter = ensure_task_filter(session, task.id)
             task_filter.max_text_length = None
             session.commit()
-            await query.edit_message_text(
-                f"✅ max_text_length 已关闭\n{filter_summary(task_filter)}",
-                reply_markup=task_filters_keyboard(task.id, task_filter),
-            )
+            await query.message.reply_text("✅ max_text_length 已关闭，当前界面保持不变。")
             return
         elif action == "task_delete_ask":
             await query.message.reply_text(f"⚠️ 二次确认删除任务 {task.id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认删除", callback_data=f"task_delete_yes:{task.id}")]]))
@@ -1388,9 +1452,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "task_delete_yes":
             session.delete(task)
             session.commit()
-            await query.edit_message_text(f"🗑 已删除任务 {task_id}")
+            tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
+            if not tasks:
+                await query.edit_message_text("🗑 已删除任务，当前暂无任务", reply_markup=simple_back_home_keyboard())
+            else:
+                await query.edit_message_text("🗑 已删除任务，返回任务列表", reply_markup=build_tasks_list_keyboard(tasks, page=0))
             return
-        await query.edit_message_text(build_task_detail_text(session, task), parse_mode=ParseMode.MARKDOWN, reply_markup=task_detail_keyboard(task_id))
+        await query.message.reply_text("✅ 操作完成。")
 
 
 async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1632,6 +1700,35 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled handler error: %s", context.error)
 
 
+def build_startup_notify_text() -> str:
+    return (
+        "✅ sosoFlow 启动成功\n"
+        f"时间: {now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"版本: {env.deploy_version}\n"
+        f"TZ: {env.tz}"
+    )
+
+
+async def notify_startup(application: Application):
+    targets = set(env.startup_notify_chat_ids)
+    if not targets:
+        targets.update(env.super_admin_ids)
+    if not targets:
+        logger.info("startup notify skipped: no target chat ids")
+        return
+    text = build_startup_notify_text()
+    for chat_id in sorted(targets):
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=text)
+            logger.info("startup notify sent to chat_id=%s", chat_id)
+        except Exception as exc:
+            logger.warning("startup notify failed chat_id=%s err=%s", chat_id, exc)
+
+
+async def post_init_hook(application: Application):
+    await notify_startup(application)
+
+
 def init_db():
     Base.metadata.create_all(engine)
     with SessionLocal() as session:
@@ -1692,6 +1789,7 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("set_delete_after_success", set_delete_after_success_cmd))
     app.add_handler(CommandHandler("set_auto_capture", set_auto_capture_cmd))
     app.add_handler(CommandHandler("set_tick", set_tick_cmd))
+    app.add_handler(CommandHandler("restart", restart_cmd))
     app.add_handler(CommandHandler("start_task", start_task_cmd))
     app.add_handler(CommandHandler("pause_task", pause_task_cmd))
     app.add_handler(CommandHandler("filters", filters_cmd))
@@ -1706,7 +1804,7 @@ def register_handlers(app: Application):
 def main():
     init_db()
     startup_self_check()
-    application = Application.builder().token(env.bot_token).build()
+    application = Application.builder().token(env.bot_token).post_init(post_init_hook).build()
     register_handlers(application)
     application.add_error_handler(on_error)
     with SessionLocal() as session:

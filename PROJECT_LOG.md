@@ -72,6 +72,16 @@
 - 新增发布脚本：
   - `push_github.bat`：一键拉取、提交、推送到 `origin/main`
   - `push_justrunmy.bat`：一键推送 `HEAD:deploy` 到 JustRunMy
+- 交互规范收敛（按钮+输入引导）：
+  - 按钮触发设置/帮助/状态等操作时，默认保持当前界面不被覆盖
+  - 通过单独消息提示用户下一步输入，减少界面跳转
+  - 需要进入下一级页面时保留返回路径，并补充“返回主菜单”按钮
+  - 引导文案改为“按提示直接输入参数文本”，降低命令记忆依赖
+- 部署与重启运维增强：
+  - 新增启动成功自动通知管理员（包含时间、版本标识、时区）
+  - 新增 `/restart`（仅 super）安全重启流程，支持 `guide|exit|exec` 策略
+  - 新增环境变量：`DEPLOY_VERSION`、`STARTUP_NOTIFY_CHAT_IDS`、`RESTART_STRATEGY`
+  - README 与 `.env.example` 已同步更新说明
 
 ### 当前状态
 
@@ -95,7 +105,11 @@
 - 纯函数测试：`pytest` 通过（`tests/test_core.py`，14 passed）
 - 新增 `pytest.ini`（`asyncio_default_fixture_loop_scope=function`）后，deprecation 警告已消除
 - 重新验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮交互改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮部署/重启功能后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 
 ### 下一步建议（最高优先）
 
 - 为任务详情补充“最近发布日志预览（最近5条）”按钮，提升运维可见性。
+- 为任务详情补充“最近发布日志预览（最近5条）”按钮，提升运维可见性，并沿用“界面保持+单独提示”交互规则。
+- 为任务详情补充“最近发布日志预览（最近5条）”按钮，并沿用“界面保持+单独提示”交互规则。
