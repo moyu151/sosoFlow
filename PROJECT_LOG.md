@@ -9,9 +9,15 @@
   - 任务详情已移除“当前轮发布/轮次”展示
   - 移除 `/set_round` 帮助文案、命令处理器与 handler 注册入口
   - `README.md` 常用命令示例移除 `/set_round`
+- 修复 Neon PostgreSQL 启动失败（缺少 psycopg2）：
+  - `requirements.txt` 增加 `psycopg2-binary`（不使用源码版 `psycopg2`）
+  - `DATABASE_URL` 兼容 `postgres://` 自动替换为 `postgresql://`
+  - 启动自检日志新增 `Database Type: sqlite/postgresql`
+  - `README.md` 补充 Neon 推荐 `DATABASE_URL` 示例（含 `sslmode=require`）
 - 本轮改动文件：
   - `main.py`
   - `README.md`
+  - `requirements.txt`
   - `PROJECT_LOG.md`
 
 ### 已验证项

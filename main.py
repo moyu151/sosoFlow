@@ -179,16 +179,23 @@ class AppEnv:
 def parse_ids(raw: str) -> list[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
+def normalize_database_url(value: str) -> str:
+    raw = (value or "").strip()
+    if raw.startswith("postgres://"):
+        return "postgresql://" + raw[len("postgres://") :]
+    return raw
+
 
 def load_env() -> AppEnv:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("BOT_TOKEN is required")
+    raw_database_url = os.getenv("DATABASE_URL", "").strip()
     return AppEnv(
         bot_token=token,
         super_admin_ids=parse_ids(os.getenv("SUPER_ADMIN_IDS", "")),
         admin_user_ids=parse_ids(os.getenv("ADMIN_USER_IDS", "")),
-        database_url=os.getenv("DATABASE_URL", "sqlite:////mnt/sosoflow/sosoflow.db"),
+        database_url=normalize_database_url(raw_database_url) or "sqlite:////mnt/sosoflow/sosoflow.db",
         tz=os.getenv("TZ", "Asia/Shanghai"),
         deploy_version=os.getenv("DEPLOY_VERSION", "").strip() or os.getenv("GIT_COMMIT", "").strip() or "unknown",
         startup_notify_chat_ids=parse_ids(os.getenv("STARTUP_NOTIFY_CHAT_IDS", "")),
@@ -2137,6 +2144,15 @@ def token_preview(token: str) -> str:
         return "***"
     return f"{token[:6]}...{token[-4:]}"
 
+def database_type(database_url: str) -> str:
+    url = (database_url or "").strip().lower()
+    if url.startswith("sqlite:"):
+        return "sqlite"
+    if url.startswith("postgresql:") or url.startswith("postgres:"):
+        return "postgresql"
+    scheme = url.split(":", 1)[0] if ":" in url else ""
+    return scheme or "unknown"
+
 
 def startup_self_check():
     with SessionLocal() as session:
@@ -2147,6 +2163,7 @@ def startup_self_check():
         normal_admins = session.scalar(select(func.count()).select_from(Admin).where(Admin.role == RoleEnum.admin)) or 0
     logger.info("===== sosoFlow startup self-check =====")
     logger.info("TZ=%s", env.tz)
+    logger.info("Database Type: %s", database_type(env.database_url))
     logger.info("DATABASE_URL=%s", env.database_url)
     logger.info("BOT_TOKEN=%s", token_preview(env.bot_token))
     logger.info("tick_seconds=%s", tick_seconds)
