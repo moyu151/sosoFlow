@@ -83,9 +83,30 @@
   - 清空时同步清理：`tasks`、`task_filters`、`queue`、`publish_logs`，并将 `user_states.current_task_id` 置空
   - 任务详情新增“♻️ 重置任务”按钮（含二次确认）
   - 重置行为：清空该任务队列与发布日志；过滤配置恢复默认；任务参数恢复默认并强制暂停，便于重新编辑
+- 修复“新建任务流程在 PostgreSQL 下中断 + 媒体组重复警告刷屏”：
+  - 根因1：`user_states.user_id` 仍为 `INTEGER`，大号 Telegram user_id（如 `5939373956`）插入时报错，导致流程中断看似“无反应”
+  - 处理1：`user_states.user_id` 改为 `BigInteger`，并在 PostgreSQL 启动时自动将旧列类型迁移为 `BIGINT`
+  - 根因2：在“等待目标ID”阶段转发媒体组且来源=目标时，每条媒体都会触发同一条警告
+  - 处理2：对同一 `(source,target,media_group_id)` 警告做去重，仅提示一次
+- 发布节奏认知修复（短间隔未按预期触发）：
+  - 根因：任务 `interval_seconds` 受全局调度 `tick_seconds` 下限影响；`interval < tick` 时实际不会快于 tick
+  - 调整：`/set_tick` 允许范围由 `10-3600` 放宽为 `1-3600`
+  - 提示增强：`/set_interval` 与任务设置“自定义间隔”在 `interval < tick` 时给出明确提示
+- 媒体组发布架构修正（发布单元从 message 升级为 publish_unit）：
+  - 新增 publish unit 辅助函数：按 `task_id + media_group_id` 聚合 `pending/waiting`，统一过滤、发布、失败、重试、状态更新
+  - 新增媒体组收敛等待：`MEDIA_GROUP_SETTLE_SECONDS=4`，组内最新消息过新时暂不发布，避免相册未收齐被拆发
+  - 媒体组主路径固定为 `send_media_group`；缺 `file_id` 时统一 `copy_messages` fallback 并写诊断日志
+  - 成功/失败/过滤按整组一致更新；`publish_logs` 增加 `publish_method=...` 标识
+  - `/retry_failed`、`/retry_waiting`、任务详情“重试失败”改为按媒体组恢复，避免只恢复其中一张
+  - 统计与详情增加发布单元视角（单条待发数量、媒体组待发数量）
+  - 新增 `/debug_queue <message_id>` 诊断命令，便于快速查看队列元数据
+  - 诊断日志字段补全 `raw_update_type/message_type/media_group_id/file_id存在性`
+  - 新增测试 `tests/test_publish_unit_arch.py`，并调整既有媒体组测试以覆盖收敛窗口语义
 - 本轮改动文件：
   - `main.py`
   - `README.md`
+  - `tests/test_media_group_publish.py`
+  - `tests/test_publish_unit_arch.py`
   - `README.md`
   - `requirements.txt`
   - `PROJECT_LOG.md`

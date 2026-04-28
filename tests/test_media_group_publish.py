@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from main import (  # noqa: E402
     QueueStatusEnum,
     Task,
     TaskModeEnum,
+    now,
     publish_one,
 )
 
@@ -61,6 +63,7 @@ def _mk_task(mode=TaskModeEnum.copy):
 def _mk_group(task_id, kind="photo", with_file_id=True):
     with main.SessionLocal() as s:
         rows = []
+        created_at = now() - timedelta(seconds=10)
         for idx, mid in enumerate([10, 11]):
             file_id = f"{kind}_{mid}" if with_file_id else None
             rows.append(
@@ -76,6 +79,7 @@ def _mk_group(task_id, kind="photo", with_file_id=True):
                     has_photo=(kind == "photo"),
                     has_video=(kind == "video"),
                     has_links=False,
+                    created_at=created_at,
                 )
             )
         s.add_all(rows)
@@ -155,16 +159,16 @@ async def test_media_group_missing_file_id_fallback_copy_messages():
 
 
 @pytest.mark.asyncio
-async def test_media_group_forward_missing_file_id_fallback_forward_messages():
+async def test_media_group_forward_missing_file_id_fallback_copy_messages():
     task_id = _mk_task(TaskModeEnum.forward)
     _mk_group(task_id, kind="photo", with_file_id=False)
 
     class Bot:
         def __init__(self):
-            self.forward_messages_called = False
+            self.copy_messages_called = False
 
-        async def forward_messages(self, chat_id, from_chat_id, message_ids):
-            self.forward_messages_called = True
+        async def copy_messages(self, chat_id, from_chat_id, message_ids):
+            self.copy_messages_called = True
             return [SimpleNamespace(message_id=400), SimpleNamespace(message_id=401)]
 
     app = SimpleNamespace(bot=Bot())
@@ -172,7 +176,7 @@ async def test_media_group_forward_missing_file_id_fallback_forward_messages():
         t = s.get(Task, task_id)
     result = await publish_one(app, t, ignore_interval=True, ignore_window=True)
     assert "发布成功 media_group" in result
-    assert app.bot.forward_messages_called is True
+    assert app.bot.copy_messages_called is True
     with main.SessionLocal() as s:
         rows = s.query(QueueItem).order_by(QueueItem.message_id.asc()).all()
         assert [r.target_message_id for r in rows] == [400, 401]

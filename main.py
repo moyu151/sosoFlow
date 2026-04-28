@@ -167,7 +167,7 @@ class GlobalSetting(Base):
 class UserState(Base):
     __tablename__ = "user_states"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     current_task_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
@@ -228,6 +228,7 @@ TASKS_PAGE_SIZE = 8
 COVER_IMAGE_PATH = os.path.join("img", "b.png")
 WAITING_RETRY_INTERVAL_MINUTES = 10
 WAITING_MAX_RETRY_COUNT = 20
+MEDIA_GROUP_SETTLE_SECONDS = 4
 
 
 def parse_hhmm(value: str) -> time:
@@ -304,18 +305,30 @@ def log_debug_media_update(update_type: str, msg):
     has_photo = bool(getattr(msg, "photo", None))
     has_video = bool(getattr(msg, "video", None))
     has_document = bool(getattr(msg, "document", None))
+    message_type = "text"
+    if has_photo:
+        message_type = "photo"
+    elif has_video:
+        message_type = "video"
+    elif has_document:
+        message_type = "document"
+    elif getattr(msg, "sticker", None):
+        message_type = "sticker"
+    elif getattr(msg, "poll", None):
+        message_type = "poll"
     caption = getattr(msg, "caption", None)
     text = getattr(msg, "text", None)
     photo_file_id = msg.photo[-1].file_id if has_photo and msg.photo else None
     video_file_id = msg.video.file_id if has_video else None
     document_file_id = msg.document.file_id if has_document else None
     logger.info(
-        "debug_media_update type=%s chat_id=%s chat_type=%s message_id=%s media_group_id=%s has_photo=%s has_video=%s has_document=%s has_caption=%s has_text=%s photo_file_id=%s video_file_id=%s document_file_id=%s",
+        "debug_media_update type=%s chat_id=%s chat_type=%s message_id=%s media_group_id=%s message_type=%s has_photo=%s has_video=%s has_document=%s has_caption=%s has_text=%s photo_file_id=%s video_file_id=%s document_file_id=%s",
         update_type,
         msg.chat_id,
         msg.chat.type,
         msg.message_id,
         msg.media_group_id,
+        message_type,
         has_photo,
         has_video,
         has_document,
@@ -415,6 +428,24 @@ def task_stats(session, task_id: int) -> dict[str, int]:
     return data
 
 
+def task_publish_unit_stats(session, task_id: int) -> tuple[int, int]:
+    pending_single = session.scalar(
+        select(func.count()).select_from(QueueItem).where(
+            QueueItem.task_id == task_id,
+            QueueItem.status == QueueStatusEnum.pending,
+            QueueItem.media_group_id.is_(None),
+        )
+    ) or 0
+    pending_groups = session.scalar(
+        select(func.count(func.distinct(QueueItem.media_group_id))).where(
+            QueueItem.task_id == task_id,
+            QueueItem.status == QueueStatusEnum.pending,
+            QueueItem.media_group_id.is_not(None),
+        )
+    ) or 0
+    return pending_single, pending_groups
+
+
 def filter_summary(task_filter: TaskFilter) -> str:
     return (
         f"图片:{'开' if task_filter.require_photo else '关'} | "
@@ -456,6 +487,7 @@ async def resolve_chat_display_name(application: Application, chat_id: int) -> O
 
 def build_task_detail_text(session, task: Task, source_name: Optional[str] = None, target_name: Optional[str] = None) -> str:
     stats = task_stats(session, task.id)
+    pending_single_units, pending_group_units = task_publish_unit_stats(session, task.id)
     task_filter = ensure_task_filter(session, task.id)
     today_start = datetime.combine(now().date(), time.min)
     today_published = session.scalar(
@@ -483,6 +515,7 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
         f"模式: {mode_label(task.mode)}\n"
         f"状态: {'🟢运行中' if task.enabled else '⏸暂停'}\n"
         f"队列统计: 待发布 {stats['pending']} | 等待重试 {stats['waiting']} | 已发布 {stats['published']} | 失败 {stats['failed']} | 跳过 {stats['skipped']}\n"
+        f"发布单元: 单条待发 {pending_single_units} | 媒体组待发 {pending_group_units}\n"
         f"今日发布: {today_published}/{task.daily_limit}\n"
         f"间隔: {task.interval_seconds}s\n"
         f"下次可发布剩余: {next_publish_in_seconds}s\n"
@@ -639,6 +672,48 @@ def write_log(session, task_id: int, source_message_id: Optional[int], target_me
     )
 
 
+def get_publish_unit_rows(session, base_item: QueueItem) -> list[QueueItem]:
+    if not base_item.media_group_id:
+        return [base_item]
+    rows = session.scalars(
+        select(QueueItem).where(
+            QueueItem.task_id == base_item.task_id,
+            QueueItem.media_group_id == base_item.media_group_id,
+            QueueItem.status.in_([QueueStatusEnum.pending, QueueStatusEnum.waiting]),
+        ).order_by(QueueItem.message_id.asc())
+    ).all()
+    return rows or [base_item]
+
+
+def is_group_settled(rows: list[QueueItem]) -> bool:
+    if not rows:
+        return True
+    if not rows[0].media_group_id:
+        return True
+    latest_created = max(row.created_at for row in rows if row.created_at)
+    if not latest_created:
+        return True
+    return (now() - latest_created).total_seconds() >= MEDIA_GROUP_SETTLE_SECONDS
+
+
+def expand_rows_by_media_group(session, rows: list[QueueItem]) -> list[QueueItem]:
+    result_map: dict[int, QueueItem] = {}
+    for row in rows:
+        if row.media_group_id:
+            grouped = session.scalars(
+                select(QueueItem).where(
+                    QueueItem.task_id == row.task_id,
+                    QueueItem.media_group_id == row.media_group_id,
+                    QueueItem.status.in_([QueueStatusEnum.failed, QueueStatusEnum.waiting]),
+                )
+            ).all()
+            for group_row in grouped:
+                result_map[group_row.id] = group_row
+        else:
+            result_map[row.id] = row
+    return list(result_map.values())
+
+
 def is_retryable_missing_message_error(raw_error: str) -> bool:
     text = (raw_error or "").lower()
     keywords = [
@@ -724,59 +799,45 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
         )
         task_filter = ensure_task_filter(session, db_task.id)
         try:
-            same_album = []
-            if item.media_group_id:
-                same_album = session.scalars(
-                    select(QueueItem).where(
-                        QueueItem.task_id == db_task.id,
-                        or_(
-                            QueueItem.status == QueueStatusEnum.pending,
-                            (QueueItem.status == QueueStatusEnum.waiting) & QueueItem.next_retry_at.is_not(None) & (QueueItem.next_retry_at <= now()),
-                        ),
-                        QueueItem.media_group_id == item.media_group_id,
-                    ).order_by(QueueItem.message_id.asc())
-                ).all()
+            publish_unit_rows = get_publish_unit_rows(session, item)
+            is_media_group_unit = bool(item.media_group_id and len(publish_unit_rows) > 0)
+            if is_media_group_unit:
                 logger.info(
-                    "publish_album_candidates task=%s media_group_id=%s count=%s",
+                    "publish_unit task=%s kind=media_group media_group_id=%s group_size=%s",
                     db_task.id,
                     item.media_group_id,
-                    len(same_album),
+                    len(publish_unit_rows),
                 )
+                if not is_group_settled(publish_unit_rows):
+                    return f"媒体组等待收齐 media_group_id={item.media_group_id}"
             else:
-                logger.info("publish_single_item task=%s message_id=%s reason=no_media_group_id", db_task.id, item.message_id)
-            if same_album:
-                # 整组过滤：任意一条不符合，则整组跳过
+                logger.info("publish_unit task=%s kind=message message_id=%s", db_task.id, item.message_id)
+            if is_media_group_unit:
                 group_reason = None
-                for album_item in same_album:
+                for album_item in publish_unit_rows:
                     reason = apply_filters(album_item, task_filter)
                     if reason:
                         group_reason = reason
                         break
                 if group_reason:
-                    for album_item in same_album:
+                    for album_item in publish_unit_rows:
                         album_item.status = QueueStatusEnum.skipped
                         album_item.fail_reason = None
                         album_item.next_retry_at = None
                         album_item.filter_reason = group_reason
                         write_log(session, db_task.id, album_item.message_id, None, "filter", group_reason)
                     session.commit()
-                    return f"已过滤 media_group={item.media_group_id} count={len(same_album)} ({group_reason})"
+                    return f"已过滤 media_group={item.media_group_id} count={len(publish_unit_rows)} ({group_reason})"
 
-                message_ids = [x.message_id for x in same_album]
-                can_send_media_group = all(
-                    x.file_id and x.message_type in {"photo", "video", "document"} for x in same_album
-                )
+                message_ids = [x.message_id for x in publish_unit_rows]
+                has_file_id_count = len([x for x in publish_unit_rows if x.file_id])
+                can_send_media_group = all(x.file_id and x.message_type in {"photo", "video", "document"} for x in publish_unit_rows)
                 sent_ids = []
+                publish_method = "send_media_group"
                 if can_send_media_group:
-                    logger.info(
-                        "publish_album_mode task=%s media_group_id=%s path=send_media_group count=%s",
-                        db_task.id,
-                        item.media_group_id,
-                        len(same_album),
-                    )
-                    caption_text = next((x.caption for x in same_album if x.caption), None)
+                    caption_text = next((x.caption for x in publish_unit_rows if x.caption), None)
                     media = []
-                    for idx, album_item in enumerate(same_album):
+                    for idx, album_item in enumerate(publish_unit_rows):
                         caption = caption_text if idx == 0 else None
                         if album_item.message_type == "photo":
                             media.append(InputMediaPhoto(media=album_item.file_id, caption=caption))
@@ -784,59 +845,33 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                             media.append(InputMediaVideo(media=album_item.file_id, caption=caption))
                         else:
                             media.append(InputMediaDocument(media=album_item.file_id, caption=caption))
-                    sent_messages = await application.bot.send_media_group(
-                        chat_id=db_task.target_chat_id,
-                        media=media,
-                    )
+                    sent_messages = await application.bot.send_media_group(chat_id=db_task.target_chat_id, media=media)
                     sent_ids = [m for m in sent_messages]
                 else:
-                    missing_details = []
-                    for album_item in same_album[:10]:
-                        if not album_item.file_id or album_item.message_type not in {"photo", "video", "document"}:
-                            missing_details.append(
-                                f"{album_item.message_id}:{album_item.message_type or 'unknown'}:{'file_id_missing' if not album_item.file_id else 'ok'}"
-                            )
-                    logger.info(
-                        "publish_album_mode task=%s media_group_id=%s path=fallback reason=cannot_send_media_group details=%s",
-                        db_task.id,
-                        item.media_group_id,
-                        ",".join(missing_details) if missing_details else "unknown",
+                    publish_method = "copy_messages_fallback"
+                    write_log(session, db_task.id, item.message_id, None, "fallback", "fallback_copy_messages_due_to_missing_file_id")
+                    sent_ids = await application.bot.copy_messages(
+                        chat_id=db_task.target_chat_id,
+                        from_chat_id=db_task.source_chat_id,
+                        message_ids=message_ids,
                     )
-                    if db_task.mode == TaskModeEnum.forward:
-                        fallback_action = "fallback_forward_messages_due_to_missing_file_id_may_split_album"
-                        write_log(session, db_task.id, item.message_id, None, "fallback", fallback_action)
-                        if hasattr(application.bot, "forward_messages"):
-                            sent_ids = await application.bot.forward_messages(
-                                chat_id=db_task.target_chat_id,
-                                from_chat_id=db_task.source_chat_id,
-                                message_ids=message_ids,
-                            )
-                        else:
-                            sent_ids = []
-                            for mid in message_ids:
-                                forwarded = await application.bot.forward_message(
-                                    chat_id=db_task.target_chat_id,
-                                    from_chat_id=db_task.source_chat_id,
-                                    message_id=mid,
-                                )
-                                sent_ids.append(forwarded)
-                    else:
-                        fallback_action = "fallback_copy_messages_due_to_missing_file_id_may_split_album"
-                        write_log(session, db_task.id, item.message_id, None, "fallback", fallback_action)
-                        sent_ids = await application.bot.copy_messages(
-                            chat_id=db_task.target_chat_id,
-                            from_chat_id=db_task.source_chat_id,
-                            message_ids=message_ids,
-                        )
+                logger.info(
+                    "publish_unit_result task=%s media_group_id=%s group_size=%s has_file_id_count=%s publish_method=%s",
+                    db_task.id,
+                    item.media_group_id,
+                    len(publish_unit_rows),
+                    has_file_id_count,
+                    publish_method,
+                )
                 published_at = now()
-                for i, album_item in enumerate(same_album):
+                for i, album_item in enumerate(publish_unit_rows):
                     target_id = sent_ids[i].message_id if i < len(sent_ids) else None
                     album_item.status = QueueStatusEnum.published
                     album_item.target_message_id = target_id
                     album_item.published_at = published_at
                     album_item.fail_reason = None
                     album_item.next_retry_at = None
-                    write_log(session, db_task.id, album_item.message_id, target_id, "publish", "发布成功")
+                    write_log(session, db_task.id, album_item.message_id, target_id, "publish", f"发布成功 publish_method={publish_method}")
                     if db_task.delete_after_success:
                         try:
                             await application.bot.delete_message(chat_id=db_task.source_chat_id, message_id=album_item.message_id)
@@ -848,7 +883,7 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                             write_log(session, db_task.id, album_item.message_id, target_id, "fail", msg)
                 db_task.last_published_at = published_at
                 session.commit()
-                return f"发布成功 media_group={item.media_group_id} count={len(same_album)}"
+                return f"发布成功 media_group={item.media_group_id} count={len(publish_unit_rows)} method={publish_method}"
             reason = apply_filters(item, task_filter)
             if reason:
                 item.status = QueueStatusEnum.skipped
@@ -891,8 +926,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     "可改用 forward 模式或检查源频道权限）"
                 )
             should_waiting = is_retryable_missing_message_error(raw_err)
-            if same_album:
-                for album_item in same_album:
+            if is_media_group_unit:
+                for album_item in publish_unit_rows:
                     if should_waiting:
                         mark_item_waiting_or_failed(session, db_task, album_item, fail_msg)
                     else:
@@ -910,8 +945,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     write_log(session, db_task.id, item.message_id, None, "fail", fail_msg)
             session.commit()
             if should_waiting:
-                if same_album:
-                    if all(album_item.status == QueueStatusEnum.failed for album_item in same_album):
+                if is_media_group_unit:
+                    if all(album_item.status == QueueStatusEnum.failed for album_item in publish_unit_rows):
                         return f"发布失败（重试超限） message_id={item.message_id}: {fail_msg}"
                     return f"等待重试 message_id={item.message_id}: {fail_msg}"
                 if item.status == QueueStatusEnum.failed:
@@ -1041,8 +1076,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/set_mode copy|forward\n"
         "/set_delete_after_success on|off\n"
         "/set_auto_capture on|off\n"
-        "/set_tick <seconds> (仅 super, 10-3600)\n"
+        "/set_tick <seconds> (仅 super, 1-3600)\n"
         "/debug_media on|off (仅 super, 媒体更新诊断)\n"
+        "/debug_queue <message_id> (admin/super)\n"
         "/restart (仅 super，触发重启流程)\n\n"
         "【过滤】(admin/super)\n"
         "/filters 查看过滤\n"
@@ -1068,6 +1104,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_count = session.scalar(select(func.count()).select_from(Task)) or 0
         enabled_count = session.scalar(select(func.count()).select_from(Task).where(Task.enabled.is_(True))) or 0
         queue_pending = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.status == QueueStatusEnum.pending)) or 0
+        pending_group_units = session.scalar(
+            select(func.count(func.distinct(QueueItem.media_group_id))).where(
+                QueueItem.status == QueueStatusEnum.pending,
+                QueueItem.media_group_id.is_not(None),
+            )
+        ) or 0
         queue_waiting = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.status == QueueStatusEnum.waiting)) or 0
         today_published = session.scalar(
             select(func.count()).select_from(QueueItem).where(
@@ -1088,6 +1130,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"任务总数: {task_count}\n"
         f"运行中: {enabled_count}\n"
         f"pending: {queue_pending}\n"
+        f"pending_media_groups: {pending_group_units}\n"
         f"waiting: {queue_waiting}\n"
         f"今日发布: {today_published}\n"
         f"今日失败: {today_failed}\n"
@@ -1265,12 +1308,13 @@ async def retry_failed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请先 /use_task <task_id>")
         return
     with SessionLocal() as session:
-        rows = session.scalars(
+        base_rows = session.scalars(
             select(QueueItem).where(
                 QueueItem.task_id == task.id,
                 QueueItem.status.in_([QueueStatusEnum.failed, QueueStatusEnum.waiting]),
             )
         ).all()
+        rows = expand_rows_by_media_group(session, base_rows)
         for row in rows:
             row.status = QueueStatusEnum.pending
             row.fail_reason = None
@@ -1286,7 +1330,8 @@ async def retry_waiting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请先 /use_task <task_id>")
         return
     with SessionLocal() as session:
-        rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.waiting)).all()
+        base_rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.waiting)).all()
+        rows = expand_rows_by_media_group(session, base_rows)
         for row in rows:
             row.status = QueueStatusEnum.pending
             row.fail_reason = None
@@ -1322,7 +1367,15 @@ async def set_interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     task_id = await set_current_task_simple(update, context, "interval_seconds", seconds)
     if task_id:
-        await update.message.reply_text(f"✅ 任务 {task_id} interval={seconds}")
+        with SessionLocal() as session:
+            setting = session.get(GlobalSetting, 1)
+            tick_seconds = setting.tick_seconds if setting else 60
+        if seconds < tick_seconds:
+            await update.message.reply_text(
+                f"✅ 任务 {task_id} interval={seconds}\n⚠️ 当前 tick_seconds={tick_seconds}，实际触发频率不会快于 tick。"
+            )
+        else:
+            await update.message.reply_text(f"✅ 任务 {task_id} interval={seconds}")
 
 
 @require_admin
@@ -1416,8 +1469,8 @@ async def set_tick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError as exc:
         await update.message.reply_text(f"参数错误：{exc}\n用法: /set_tick <seconds>")
         return
-    if not 10 <= seconds <= 3600:
-        await update.message.reply_text("tick_seconds 允许范围 10-3600")
+    if not 1 <= seconds <= 3600:
+        await update.message.reply_text("tick_seconds 允许范围 1-3600")
         return
     with SessionLocal() as session:
         setting = session.get(GlobalSetting, 1)
@@ -1446,6 +1499,39 @@ async def debug_media_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setting.debug_media_updates = enabled
         session.commit()
     await update.message.reply_text(f"✅ debug_media_updates={'on' if enabled else 'off'}")
+
+
+@require_admin
+async def debug_queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task = get_current_task(update.effective_user.id)
+    if not task:
+        await update.message.reply_text("请先 /use_task <task_id>")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("用法: /debug_queue <message_id>")
+        return
+    try:
+        message_id = parse_int(context.args[0], "message_id")
+    except ValueError as exc:
+        await update.message.reply_text(f"参数错误：{exc}\n用法: /debug_queue <message_id>")
+        return
+    with SessionLocal() as session:
+        row = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == message_id))
+        if not row:
+            await update.message.reply_text("未找到该消息ID的队列记录")
+            return
+        await update.message.reply_text(
+            "🔎 debug_queue\n"
+            f"task_id={row.task_id}\n"
+            f"message_id={row.message_id}\n"
+            f"media_group_id={row.media_group_id or 'None'}\n"
+            f"file_id_exists={bool(row.file_id)}\n"
+            f"status={row.status.value}\n"
+            f"message_type={row.message_type or 'unknown'}\n"
+            f"caption_exists={bool(row.caption)}\n"
+            f"retry_count={row.retry_count}\n"
+            f"next_retry_at={row.next_retry_at or 'None'}"
+        )
 
 
 @require_super
@@ -1744,12 +1830,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.reply_text("⚠️ 机器人不在目标频道/群组，请先添加机器人后重试。", reply_markup=kb)
             return
         elif action == "task_retry":
-            rows = session.scalars(
+            base_rows = session.scalars(
                 select(QueueItem).where(
                     QueueItem.task_id == task.id,
                     QueueItem.status.in_([QueueStatusEnum.failed, QueueStatusEnum.waiting]),
                 )
             ).all()
+            rows = expand_rows_by_media_group(session, base_rows)
             for row in rows:
                 row.status = QueueStatusEnum.pending
                 row.fail_reason = None
@@ -2124,10 +2211,13 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
             task.interval_seconds = seconds
             session.commit()
             session.refresh(task)
-            await msg.reply_text(
-                f"✅ 间隔已更新为 {seconds} 秒",
-                reply_markup=task_settings_keyboard(task),
-            )
+            setting = session.get(GlobalSetting, 1)
+            tick_seconds = setting.tick_seconds if setting else 60
+            if seconds < tick_seconds:
+                reply_text = f"✅ 间隔已更新为 {seconds} 秒\n⚠️ 当前 tick_seconds={tick_seconds}，实际触发频率不会快于 tick。"
+            else:
+                reply_text = f"✅ 间隔已更新为 {seconds} 秒"
+            await msg.reply_text(reply_text, reply_markup=task_settings_keyboard(task))
         context.user_data.pop("pending_input_action", None)
         context.user_data.pop("pending_task_id", None)
         return True
@@ -2278,7 +2368,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     with SessionLocal() as session:
         debug_media = is_debug_media_enabled(session)
     if debug_media:
-        logger.info("debug_update_type=%s", update_type)
+        logger.info("raw_update_type=%s", update_type)
         if update_type in {"message", "channel_post", "edited_message", "edited_channel_post"}:
             log_debug_media_update(update_type, typed_msg)
     msg = typed_msg or update.effective_message
@@ -2327,7 +2417,10 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             target_chat_id = forward_chat_id
             if source_chat_id == target_chat_id:
-                await msg.reply_text("⚠️ 识别到来源ID与目标ID相同，请转发目标频道/群组消息或直接输入目标ID。")
+                warn_key = f"{source_chat_id}:{target_chat_id}:{msg.media_group_id or msg.message_id}"
+                if context.user_data.get("last_same_pair_warn_key") != warn_key:
+                    context.user_data["last_same_pair_warn_key"] = warn_key
+                    await msg.reply_text("⚠️ 识别到来源ID与目标ID相同，请转发目标频道/群组消息或直接输入目标ID。")
                 return
             with SessionLocal() as session:
                 task, created = get_or_create_task_by_pair(session, source_chat_id, target_chat_id)
@@ -2340,6 +2433,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 session.commit()
             context.user_data.pop("pending_input_action", None)
             context.user_data.pop("pending_task_source_chat_id", None)
+            context.user_data.pop("last_same_pair_warn_key", None)
             if created:
                 await msg.reply_text(
                     f"✅ 已自动确认目标ID并创建任务\nID={task.id}\n名称: {task.name}\n源: {source_chat_id}\n目标: {target_chat_id}",
@@ -2507,6 +2601,7 @@ async def post_init_hook(application: Application):
             BotCommand("retry_failed", "重试失败消息"),
             BotCommand("retry_waiting", "重试等待消息"),
             BotCommand("debug_media", "媒体更新诊断（仅super）"),
+            BotCommand("debug_queue", "查看队列元数据"),
             BotCommand("restart", "重启流程（仅super）"),
         ]
     )
@@ -2559,6 +2654,26 @@ def init_db():
         if "debug_media_updates" not in gs_columns:
             conn.execute(sql_text("ALTER TABLE global_settings ADD COLUMN debug_media_updates BOOLEAN DEFAULT FALSE"))
             conn.execute(sql_text("UPDATE global_settings SET debug_media_updates = FALSE WHERE debug_media_updates IS NULL"))
+    if database_type(env.database_url) == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(
+                sql_text(
+                    """
+                    DO $$
+                    DECLARE col_type text;
+                    BEGIN
+                        SELECT data_type INTO col_type
+                        FROM information_schema.columns
+                        WHERE table_name = 'user_states' AND column_name = 'user_id'
+                        LIMIT 1;
+                        IF col_type IS NOT NULL AND col_type <> 'bigint' THEN
+                            EXECUTE 'ALTER TABLE user_states ALTER COLUMN user_id TYPE BIGINT';
+                        END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
     with SessionLocal() as session:
         setting = session.get(GlobalSetting, 1)
         if not setting:
@@ -2641,6 +2756,7 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("set_auto_capture", set_auto_capture_cmd))
     app.add_handler(CommandHandler("set_tick", set_tick_cmd))
     app.add_handler(CommandHandler("debug_media", debug_media_cmd))
+    app.add_handler(CommandHandler("debug_queue", debug_queue_cmd))
     app.add_handler(CommandHandler("restart", restart_cmd))
     app.add_handler(CommandHandler("start_task", start_task_cmd))
     app.add_handler(CommandHandler("pause_task", pause_task_cmd))

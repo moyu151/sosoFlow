@@ -147,3 +147,7 @@ pytest
 4. 若日志没有 `channel_post` 类型，说明机器人未收到频道更新或监听未覆盖频道更新
 5. 若有 `channel_post` 但 `media_group_id=None`，说明 Telegram 侧并非以相册方式送达
 6. 诊断完成后执行：`/debug_media off`
+
+补充：
+- 可用 `/debug_queue <message_id>` 查看该队列项的 `media_group_id/file_id/status/message_type/caption` 元数据。
+- 媒体组发布默认有收敛等待窗口（`media_group_settle_seconds`，当前 4 秒），避免“相册还没收齐就被提前发布”。
