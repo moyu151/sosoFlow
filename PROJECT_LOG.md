@@ -120,6 +120,7 @@
 - 本次“导入范围阻塞新帖”修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（35 passed）
 - 本次“媒体组占位补全”修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（36 passed）
 - 本次“channel_post 捕获链路修复”后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（37 passed）
+- 本次“范围自动完成”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（39 passed）
 
 ### 增量更新（本次）
 
@@ -145,6 +146,17 @@
 - 新增回归测试：
   - `tests/test_capture_channel_post.py` 增加 `test_channel_post_without_effective_user_still_captured_with_media_group`
   - 验证 `effective_user=None` 的 `channel_post` 仍能入队并保留媒体组元数据
+- 新增“范围发布自动完成”能力：
+  - `tasks` 新增字段：`range_start_message_id`、`range_end_message_id`、`is_completed`、`completed_at`
+  - `/import_range`（命令与按钮输入两条路径）会写入任务范围并清除完成态
+  - 发布选择 `pick_next_publish_item` 在任务有范围时仅从范围内选 `pending/waiting`，不再继续消费范围外旧队列
+  - 当范围内不再有 `pending/waiting`（即全部进入 `published/skipped/failed` 终态）时，自动将任务设为 `is_completed=true` 且 `enabled=false`
+  - 自动完成会写入 `publish_logs(action=complete, message=范围消息处理完成，任务自动停止)`
+  - 手动启动任务（命令/按钮）会清除完成态，允许后续继续运行
+  - 任务详情与任务列表已展示“✅已完成”状态
+- 新增回归测试：
+  - `tests/test_range_completion.py::test_pick_next_publish_item_respects_task_range`
+  - `tests/test_range_completion.py::test_publish_one_auto_completes_task_when_range_done`
 
 ### 下一步建议（最高优先）
 

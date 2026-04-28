@@ -92,6 +92,10 @@ class Task(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_capture_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     delete_after_success: Mapped[bool] = mapped_column(Boolean, default=False)
+    range_start_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    range_end_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    is_completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -506,6 +510,12 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
         next_publish_in_seconds = max(task.interval_seconds - elapsed, 0)
     source_line = f"{task.source_chat_id}" if not source_name else f"{task.source_chat_id}（{source_name}）"
     target_line = f"{task.target_chat_id}" if not target_name else f"{task.target_chat_id}（{target_name}）"
+    status_text = "✅已完成" if task.is_completed else ("🟢运行中" if task.enabled else "⏸暂停")
+    range_text = (
+        f"{task.range_start_message_id}-{task.range_end_message_id}"
+        if task.range_start_message_id is not None and task.range_end_message_id is not None
+        else "未设置"
+    )
     return (
         f"🧩 任务详情\n"
         f"ID: {task.id}\n"
@@ -513,7 +523,8 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
         f"源: {source_line}\n"
         f"目标: {target_line}\n"
         f"模式: {mode_label(task.mode)}\n"
-        f"状态: {'🟢运行中' if task.enabled else '⏸暂停'}\n"
+        f"状态: {status_text}\n"
+        f"发布范围: {range_text}\n"
         f"队列统计: 待发布 {stats['pending']} | 等待重试 {stats['waiting']} | 已发布 {stats['published']} | 失败 {stats['failed']} | 跳过 {stats['skipped']}\n"
         f"发布单元: 单条待发 {pending_single_units} | 媒体组待发 {pending_group_units}\n"
         f"今日发布: {today_published}/{task.daily_limit}\n"
@@ -739,29 +750,67 @@ def mark_item_waiting_or_failed(session, db_task: Task, queue_item: QueueItem, f
 
 
 def pick_next_publish_item(session, task_id: int) -> Optional[QueueItem]:
+    task = session.get(Task, task_id)
+    range_start = task.range_start_message_id if task else None
+    range_end = task.range_end_message_id if task else None
+    base_pending = select(QueueItem).where(QueueItem.task_id == task_id, QueueItem.status == QueueStatusEnum.pending)
+    if range_start is not None and range_end is not None:
+        base_pending = base_pending.where(QueueItem.message_id >= range_start, QueueItem.message_id <= range_end)
     # 优先发布实时捕获的消息（有元数据），避免 /import_range 大范围占位ID阻塞新消息。
     pending_item = session.scalar(
-        select(QueueItem).where(
-            QueueItem.task_id == task_id,
-            QueueItem.status == QueueStatusEnum.pending,
+        base_pending.where(
             QueueItem.message_type != "unknown",
         ).order_by(QueueItem.message_id.asc())
     )
     if pending_item:
         return pending_item
     pending_item = session.scalar(
-        select(QueueItem).where(QueueItem.task_id == task_id, QueueItem.status == QueueStatusEnum.pending).order_by(QueueItem.message_id.asc())
+        base_pending.order_by(QueueItem.message_id.asc())
     )
     if pending_item:
         return pending_item
-    return session.scalar(
-        select(QueueItem).where(
-            QueueItem.task_id == task_id,
-            QueueItem.status == QueueStatusEnum.waiting,
-            QueueItem.next_retry_at.is_not(None),
-            QueueItem.next_retry_at <= now(),
-        ).order_by(QueueItem.message_id.asc())
+    waiting_query = select(QueueItem).where(
+        QueueItem.task_id == task_id,
+        QueueItem.status == QueueStatusEnum.waiting,
+        QueueItem.next_retry_at.is_not(None),
+        QueueItem.next_retry_at <= now(),
     )
+    if range_start is not None and range_end is not None:
+        waiting_query = waiting_query.where(QueueItem.message_id >= range_start, QueueItem.message_id <= range_end)
+    return session.scalar(
+        waiting_query.order_by(QueueItem.message_id.asc())
+    )
+
+
+def has_task_range(task: Task) -> bool:
+    return task.range_start_message_id is not None and task.range_end_message_id is not None
+
+
+def finalize_task_as_completed(session, task: Task, reason: str):
+    task.enabled = False
+    task.is_completed = True
+    task.completed_at = now()
+    write_log(session, task.id, None, None, "complete", reason)
+
+
+def try_auto_complete_task_range(session, task: Task) -> bool:
+    if not has_task_range(task):
+        return False
+    unfinished = session.scalar(
+        select(func.count()).select_from(QueueItem).where(
+            QueueItem.task_id == task.id,
+            QueueItem.message_id >= task.range_start_message_id,
+            QueueItem.message_id <= task.range_end_message_id,
+            QueueItem.status.in_([QueueStatusEnum.pending, QueueStatusEnum.waiting]),
+        )
+    ) or 0
+    if unfinished > 0:
+        return False
+    if task.is_completed and not task.enabled:
+        return True
+    finalize_task_as_completed(session, task, "范围消息处理完成，任务自动停止")
+    session.commit()
+    return True
 
 
 def add_bot_to_chat_keyboard(application: Application) -> Optional[InlineKeyboardMarkup]:
@@ -837,6 +886,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
         db_task = session.get(Task, task.id)
         if not db_task:
             return "任务不存在"
+        if try_auto_complete_task_range(session, db_task):
+            return "范围消息处理完成，任务已自动停止"
         if not ignore_window and not in_time_window(db_task):
             return "不在允许时间段"
         today_start = datetime.combine(now().date(), time.min)
@@ -855,6 +906,8 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                 return "未到发布间隔"
         item = pick_next_publish_item(session, db_task.id)
         if not item:
+            if try_auto_complete_task_range(session, db_task):
+                return "范围消息处理完成，任务已自动停止"
             return "无可发布消息（pending/waiting）"
         logger.info(
             "publish_pick task=%s message_id=%s status=%s media_group_id=%s",
@@ -1088,7 +1141,7 @@ def build_tasks_list_keyboard(tasks: list[Task], page: int):
     start = page * TASKS_PAGE_SIZE
     end = start + TASKS_PAGE_SIZE
     page_items = tasks[start:end]
-    rows = [[InlineKeyboardButton(f"{'🟢' if t.enabled else '⏸'} {t.id} {t.name}", callback_data=f"task_view:{t.id}")] for t in page_items]
+    rows = [[InlineKeyboardButton(f"{'✅' if t.is_completed else ('🟢' if t.enabled else '⏸')} {t.id} {t.name}", callback_data=f"task_view:{t.id}")] for t in page_items]
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"tasks_page:{page - 1}"))
@@ -1317,6 +1370,14 @@ async def import_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inserted = 0
     duplicated = 0
     with SessionLocal() as session:
+        db_task = session.get(Task, task.id)
+        if not db_task:
+            await update.message.reply_text("任务不存在")
+            return
+        db_task.range_start_message_id = start_id
+        db_task.range_end_message_id = end_id
+        db_task.is_completed = False
+        db_task.completed_at = None
         for msg_id in range(start_id, end_id + 1):
             exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == msg_id))
             if exists:
@@ -1327,6 +1388,7 @@ async def import_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session.commit()
     await update.message.reply_text(
         f"✅ 导入完成\n"
+        f"范围已设定: {start_id}-{end_id}\n"
         f"入队新增: {inserted}（仅按ID范围入队，未校验消息是否实际存在）\n"
         f"重复跳过: {duplicated}"
     )
@@ -1634,6 +1696,12 @@ async def _delayed_restart_or_exit(exec_mode: bool):
 async def start_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = await set_current_task_simple(update, context, "enabled", True)
     if task_id:
+        with SessionLocal() as session:
+            db_task = session.get(Task, task_id)
+            if db_task:
+                db_task.is_completed = False
+                db_task.completed_at = None
+                session.commit()
         await update.message.reply_text("✅ 任务已启动")
 
 
@@ -1865,6 +1933,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if action == "task_start":
             task.enabled = True
+            task.is_completed = False
+            task.completed_at = None
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
             target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
@@ -2202,7 +2272,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
         if not matched:
             await msg.reply_text("未找到匹配任务，请重试关键词")
             return True
-        kb = [[InlineKeyboardButton(f"{'🟢' if t.enabled else '⏸'} {t.id} {t.name}", callback_data=f"task_view:{t.id}")] for t in matched[:20]]
+        kb = [[InlineKeyboardButton(f"{'✅' if t.is_completed else ('🟢' if t.enabled else '⏸')} {t.id} {t.name}", callback_data=f"task_view:{t.id}")] for t in matched[:20]]
         await msg.reply_text(f"🔎 搜索结果：{len(matched)} 条", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data.pop("pending_input_action", None)
         return True
@@ -2237,6 +2307,10 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("pending_input_action", None)
                 context.user_data.pop("pending_task_id", None)
                 return True
+            task.range_start_message_id = start_id
+            task.range_end_message_id = end_id
+            task.is_completed = False
+            task.completed_at = None
             for mid in range(start_id, end_id + 1):
                 exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == mid))
                 if exists:
@@ -2247,6 +2321,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
             session.commit()
         await msg.reply_text(
             f"✅ 导入完成\n"
+            f"范围已设定: {start_id}-{end_id}\n"
             f"入队新增: {inserted}（仅按ID范围入队，未校验消息是否实际存在）\n"
             f"重复跳过: {duplicated}"
         )
@@ -2696,6 +2771,18 @@ def init_db():
             )
     # 轻量自迁移：为旧库补齐 queue/global_settings 新字段
     inspector = inspect(engine)
+    task_columns = {col["name"] for col in inspector.get_columns("tasks")}
+    with engine.begin() as conn:
+        if "range_start_message_id" not in task_columns:
+            conn.execute(sql_text("ALTER TABLE tasks ADD COLUMN range_start_message_id BIGINT"))
+        if "range_end_message_id" not in task_columns:
+            conn.execute(sql_text("ALTER TABLE tasks ADD COLUMN range_end_message_id BIGINT"))
+        if "is_completed" not in task_columns:
+            conn.execute(sql_text("ALTER TABLE tasks ADD COLUMN is_completed BOOLEAN DEFAULT FALSE"))
+            conn.execute(sql_text("UPDATE tasks SET is_completed = FALSE WHERE is_completed IS NULL"))
+        if "completed_at" not in task_columns:
+            completed_at_type = "TIMESTAMP" if database_type(env.database_url) == "postgresql" else "DATETIME"
+            conn.execute(sql_text(f"ALTER TABLE tasks ADD COLUMN completed_at {completed_at_type}"))
     columns = {col["name"] for col in inspector.get_columns("queue")}
     with engine.begin() as conn:
         if "file_id" not in columns:

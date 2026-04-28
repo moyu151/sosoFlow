@@ -1,0 +1,84 @@
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("BOT_TOKEN", "test-token")
+os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+
+import main  # noqa: E402
+from main import Base, QueueItem, QueueStatusEnum, Task, TaskModeEnum, pick_next_publish_item, publish_one  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_db():
+    test_engine = create_engine("sqlite:///:memory:", future=True)
+    test_session_local = sessionmaker(bind=test_engine, expire_on_commit=False, future=True)
+    old_engine = main.engine
+    old_session_local = main.SessionLocal
+    main.engine = test_engine
+    main.SessionLocal = test_session_local
+    Base.metadata.drop_all(main.engine)
+    Base.metadata.create_all(main.engine)
+    yield
+    main.engine = old_engine
+    main.SessionLocal = old_session_local
+
+
+def _mk_task_with_range():
+    with main.SessionLocal() as session:
+        task = Task(
+            name="range-task",
+            source_chat_id=-10001,
+            target_chat_id=-10002,
+            mode=TaskModeEnum.copy,
+            interval_seconds=1,
+            daily_limit=999999,
+            active_start_time="00:00",
+            active_end_time="23:59",
+            enabled=True,
+            range_start_message_id=100,
+            range_end_message_id=102,
+        )
+        session.add(task)
+        session.commit()
+        session.refresh(task)
+        return task.id
+
+
+def test_pick_next_publish_item_respects_task_range():
+    task_id = _mk_task_with_range()
+    with main.SessionLocal() as session:
+        session.add(QueueItem(task_id=task_id, message_id=90, status=QueueStatusEnum.pending, message_type="text"))
+        session.add(QueueItem(task_id=task_id, message_id=100, status=QueueStatusEnum.pending, message_type="text"))
+        session.commit()
+        picked = pick_next_publish_item(session, task_id)
+        assert picked is not None
+        assert picked.message_id == 100
+
+
+@pytest.mark.asyncio
+async def test_publish_one_auto_completes_task_when_range_done():
+    task_id = _mk_task_with_range()
+    with main.SessionLocal() as session:
+        session.add(QueueItem(task_id=task_id, message_id=100, status=QueueStatusEnum.published, message_type="text"))
+        session.add(QueueItem(task_id=task_id, message_id=101, status=QueueStatusEnum.failed, message_type="text"))
+        session.add(QueueItem(task_id=task_id, message_id=102, status=QueueStatusEnum.skipped, message_type="text"))
+        session.commit()
+        task = session.get(Task, task_id)
+
+    app = SimpleNamespace(bot=SimpleNamespace())
+    result = await publish_one(app, task, ignore_interval=True, ignore_window=True)
+    assert "范围消息处理完成" in result
+    with main.SessionLocal() as session:
+        db_task = session.get(Task, task_id)
+        assert db_task.enabled is False
+        assert db_task.is_completed is True
+        assert db_task.completed_at is not None
+        complete_logs = session.scalars(select(main.PublishLog).where(main.PublishLog.task_id == task_id, main.PublishLog.action == "complete")).all()
+        assert len(complete_logs) >= 1
