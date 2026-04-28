@@ -143,6 +143,20 @@
   - 保留环境变量优先级：若已设置 `DATABASE_URL`，继续优先使用环境变量
   - 启动初始化时自动执行 `os.makedirs("/mnt/sosoflow", exist_ok=True)`，确保 SQLite 目录存在
   - README 补充 JustRunMyApp 推荐配置 `DATABASE_URL=sqlite:////mnt/sosoflow/sosoflow.db`
+- 时段与手动发布认知修复：
+  - 任务默认时段由 `09:00-23:30` 调整为全天 `00:00-23:59`
+  - 启动时自动迁移历史“旧默认时段”任务到全天（仅迁移 `09:00-23:30`）
+  - 发布失败 `The message can't be copied` 增强说明：明确该错误通常不是时段导致，提示可改用 `forward` 或检查源权限/受保护内容
+- 媒体组（media group）合并发布能力补全：
+  - 发布入口仍先取最小 `message_id` 的 pending；若存在 `media_group_id`，则聚合同组 pending 并按 `message_id` 排序
+  - 组发布路径：
+    - `copy` 模式：批量 `copy_messages`，保持同组不拆分
+    - `forward` 模式：优先 `forward_messages`，不支持时回退逐条 `forward_message`
+  - 过滤逻辑升级为“整组判断”：任意一条命中过滤规则，整组 `skipped`
+  - 失败逻辑升级为“整组失败”：任意异常时整组 `failed` 并写统一 `fail_reason`
+  - 成功逻辑保持整组落库：每条记录写 `published/target_message_id/publish_logs`
+  - 新消息捕获补充 `document` 类型识别（用于媒体组元数据完整性）
+  - 非媒体组消息发布逻辑保持不变
 
 ### 当前状态
 
@@ -183,6 +197,8 @@
 - 本轮任务设置面板交互收敛后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮交互与发布稳定性修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮数据持久化默认路径优化后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮时段与手动发布认知修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
+- 本轮媒体组合并发布能力补全后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（18 passed）
 
 ### 下一步建议（最高优先）
 

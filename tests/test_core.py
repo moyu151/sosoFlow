@@ -100,3 +100,36 @@ def test_limit_helpers():
     assert reached_daily_limit(9, 10) is False
     assert reached_round_limit(20, 20) is True
     assert reached_round_limit(19, 20) is False
+
+
+def test_album_like_single_photo_filter_pass():
+    task_filter = TaskFilter(require_photo=True)
+    item = DummyQueueItem(has_text=True, has_photo=True, has_video=False, has_links=False, message_type="photo", text_preview="cap")
+    reason = apply_filters(item, task_filter)
+    assert reason is None
+
+
+def test_album_like_multi_photo_filter_pass():
+    task_filter = TaskFilter(require_photo=True)
+    items = [
+        DummyQueueItem(has_text=True, has_photo=True, has_video=False, has_links=False, message_type="photo", text_preview="a"),
+        DummyQueueItem(has_text=False, has_photo=True, has_video=False, has_links=False, message_type="photo", text_preview=""),
+    ]
+    assert all(apply_filters(i, task_filter) is None for i in items)
+
+
+def test_album_like_photo_video_filter_pass():
+    task_filter = TaskFilter()
+    items = [
+        DummyQueueItem(has_text=True, has_photo=True, has_video=False, has_links=False, message_type="photo", text_preview="a"),
+        DummyQueueItem(has_text=False, has_photo=False, has_video=True, has_links=False, message_type="video", text_preview=""),
+    ]
+    assert all(apply_filters(i, task_filter) is None for i in items)
+
+
+def test_album_like_caption_present_or_absent():
+    task_filter = TaskFilter(min_text_length=1)
+    with_caption = DummyQueueItem(has_text=True, has_photo=True, has_video=False, has_links=False, message_type="photo", text_preview="x")
+    without_caption = DummyQueueItem(has_text=False, has_photo=True, has_video=False, has_links=False, message_type="photo", text_preview="")
+    assert apply_filters(with_caption, task_filter) is None
+    assert apply_filters(without_caption, task_filter) == "文字过短"

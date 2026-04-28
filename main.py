@@ -81,8 +81,8 @@ class Task(Base):
     daily_limit: Mapped[int] = mapped_column(Integer, default=100)
     round_hours: Mapped[int] = mapped_column(Integer, default=24)
     round_limit: Mapped[int] = mapped_column(Integer, default=20)
-    active_start_time: Mapped[str] = mapped_column(String(5), default="09:00")
-    active_end_time: Mapped[str] = mapped_column(String(5), default="23:30")
+    active_start_time: Mapped[str] = mapped_column(String(5), default="00:00")
+    active_end_time: Mapped[str] = mapped_column(String(5), default="23:59")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_capture_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     delete_after_success: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -595,13 +595,6 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
         if not item:
             return "无 pending 消息"
         task_filter = ensure_task_filter(session, db_task.id)
-        reason = apply_filters(item, task_filter)
-        if reason:
-            item.status = QueueStatusEnum.skipped
-            item.filter_reason = reason
-            write_log(session, db_task.id, item.message_id, None, "filter", reason)
-            session.commit()
-            return f"已过滤 message_id={item.message_id} ({reason})"
         try:
             same_album = []
             if item.media_group_id:
@@ -613,6 +606,21 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     ).order_by(QueueItem.message_id.asc())
                 ).all()
             if same_album:
+                # 整组过滤：任意一条不符合，则整组跳过
+                group_reason = None
+                for album_item in same_album:
+                    reason = apply_filters(album_item, task_filter)
+                    if reason:
+                        group_reason = reason
+                        break
+                if group_reason:
+                    for album_item in same_album:
+                        album_item.status = QueueStatusEnum.skipped
+                        album_item.filter_reason = group_reason
+                        write_log(session, db_task.id, album_item.message_id, None, "filter", group_reason)
+                    session.commit()
+                    return f"已过滤 media_group={item.media_group_id} count={len(same_album)} ({group_reason})"
+
                 message_ids = [x.message_id for x in same_album]
                 if db_task.mode == TaskModeEnum.copy:
                     sent_ids = await application.bot.copy_messages(
@@ -621,11 +629,21 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                         message_ids=message_ids,
                     )
                 else:
-                    sent_ids = await application.bot.forward_messages(
-                        chat_id=db_task.target_chat_id,
-                        from_chat_id=db_task.source_chat_id,
-                        message_ids=message_ids,
-                    )
+                    if hasattr(application.bot, "forward_messages"):
+                        sent_ids = await application.bot.forward_messages(
+                            chat_id=db_task.target_chat_id,
+                            from_chat_id=db_task.source_chat_id,
+                            message_ids=message_ids,
+                        )
+                    else:
+                        sent_ids = []
+                        for mid in message_ids:
+                            forwarded = await application.bot.forward_message(
+                                chat_id=db_task.target_chat_id,
+                                from_chat_id=db_task.source_chat_id,
+                                message_id=mid,
+                            )
+                            sent_ids.append(forwarded)
                 published_at = now()
                 for i, album_item in enumerate(same_album):
                     target_id = sent_ids[i].message_id if i < len(sent_ids) else None
@@ -645,6 +663,13 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                 db_task.last_published_at = published_at
                 session.commit()
                 return f"发布成功 media_group={item.media_group_id} count={len(same_album)}"
+            reason = apply_filters(item, task_filter)
+            if reason:
+                item.status = QueueStatusEnum.skipped
+                item.filter_reason = reason
+                write_log(session, db_task.id, item.message_id, None, "filter", reason)
+                session.commit()
+                return f"已过滤 message_id={item.message_id} ({reason})"
             if db_task.mode == TaskModeEnum.copy:
                 sent = await application.bot.copy_message(chat_id=db_task.target_chat_id, from_chat_id=db_task.source_chat_id, message_id=item.message_id)
                 target_id = sent.message_id if sent else None
@@ -668,11 +693,24 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
             session.commit()
             return f"发布成功 message_id={item.message_id}"
         except Exception as exc:
-            item.status = QueueStatusEnum.failed
-            item.fail_reason = str(exc)
-            write_log(session, db_task.id, item.message_id, None, "fail", str(exc))
+            raw_err = str(exc)
+            fail_msg = raw_err
+            if "can't be copied" in raw_err.lower():
+                fail_msg = (
+                    f"{raw_err}（该错误通常不是时段导致；可能是源消息受保护/复制受限，"
+                    "可改用 forward 模式或检查源频道权限）"
+                )
+            if same_album:
+                for album_item in same_album:
+                    album_item.status = QueueStatusEnum.failed
+                    album_item.fail_reason = fail_msg
+                    write_log(session, db_task.id, album_item.message_id, None, "fail", fail_msg)
+            else:
+                item.status = QueueStatusEnum.failed
+                item.fail_reason = fail_msg
+                write_log(session, db_task.id, item.message_id, None, "fail", fail_msg)
             session.commit()
-            return f"发布失败 message_id={item.message_id}: {exc}"
+            return f"发布失败 message_id={item.message_id}: {fail_msg}"
 
 
 async def publish_tick(application: Application):
@@ -954,7 +992,11 @@ async def import_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(QueueItem(task_id=task.id, message_id=msg_id, message_type="unknown"))
             inserted += 1
         session.commit()
-    await update.message.reply_text(f"✅ 导入完成\n新增: {inserted}\n重复跳过: {duplicated}")
+    await update.message.reply_text(
+        f"✅ 导入完成\n"
+        f"入队新增: {inserted}（仅按ID范围入队，未校验消息是否实际存在）\n"
+        f"重复跳过: {duplicated}"
+    )
 
 
 @require_admin
@@ -1692,7 +1734,11 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 session.add(QueueItem(task_id=task.id, message_id=mid, message_type="unknown"))
                 inserted += 1
             session.commit()
-        await msg.reply_text(f"✅ 导入完成\n新增: {inserted}\n重复跳过: {duplicated}")
+        await msg.reply_text(
+            f"✅ 导入完成\n"
+            f"入队新增: {inserted}（仅按ID范围入队，未校验消息是否实际存在）\n"
+            f"重复跳过: {duplicated}"
+        )
         context.user_data.pop("pending_input_action", None)
         context.user_data.pop("pending_task_id", None)
         return True
@@ -1993,6 +2039,8 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         message_type = "photo"
     elif msg.video:
         message_type = "video"
+    elif msg.document:
+        message_type = "document"
     elif msg.sticker:
         message_type = "sticker"
     elif msg.poll:
@@ -2081,6 +2129,13 @@ def init_db():
             existing = session.scalar(select(Admin).where(Admin.telegram_user_id == uid))
             if not existing:
                 session.add(Admin(telegram_user_id=uid, role=RoleEnum.admin))
+        # 历史默认时段迁移：将旧默认 09:00-23:30 统一迁移为全天
+        legacy_default_tasks = session.scalars(
+            select(Task).where(Task.active_start_time == "09:00", Task.active_end_time == "23:30")
+        ).all()
+        for t in legacy_default_tasks:
+            t.active_start_time = "00:00"
+            t.active_end_time = "23:59"
         session.commit()
 
 
