@@ -2333,7 +2333,8 @@ def init_db():
             conn.execute(sql_text("ALTER TABLE queue ADD COLUMN retry_count INTEGER DEFAULT 0"))
             conn.execute(sql_text("UPDATE queue SET retry_count = 0 WHERE retry_count IS NULL"))
         if "next_retry_at" not in columns:
-            conn.execute(sql_text("ALTER TABLE queue ADD COLUMN next_retry_at DATETIME"))
+            next_retry_type = "TIMESTAMP" if database_type(env.database_url) == "postgresql" else "DATETIME"
+            conn.execute(sql_text(f"ALTER TABLE queue ADD COLUMN next_retry_at {next_retry_type}"))
 
 
 def token_preview(token: str) -> str:

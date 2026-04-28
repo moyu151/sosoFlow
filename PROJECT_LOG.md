@@ -47,6 +47,9 @@
   - 无 `media_group_id` 时明确记录 `publish_single_item reason=no_media_group_id`
   - 可走真正相册时记录 `publish_album_mode path=send_media_group`
   - 走 fallback 时记录 `publish_album_mode path=fallback`，并输出明细（如 `message_type` 非 `photo/video/document` 或 `file_id_missing`）
+- 修复 Neon/PostgreSQL 启动迁移报错：
+  - 问题：`ALTER TABLE queue ADD COLUMN next_retry_at DATETIME` 在 PostgreSQL 报 `type "datetime" does not exist`
+  - 处理：`init_db` 按数据库类型选择列类型：PostgreSQL 使用 `TIMESTAMP`，SQLite 使用 `DATETIME`
 - 本轮改动文件：
   - `main.py`
   - `README.md`
