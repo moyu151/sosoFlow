@@ -11,6 +11,7 @@ from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import InputMediaDocument, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -31,7 +32,9 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     func,
+    inspect,
     select,
+    text as sql_text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -118,6 +121,8 @@ class QueueItem(Base):
     status: Mapped[QueueStatusEnum] = mapped_column(SqlEnum(QueueStatusEnum), default=QueueStatusEnum.pending)
     target_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     message_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    file_id: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     text_preview: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
     has_text: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     has_photo: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
@@ -359,14 +364,6 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
             QueueItem.published_at >= today_start,
         )
     ) or 0
-    round_start = now() - timedelta(hours=task.round_hours)
-    round_published = session.scalar(
-        select(func.count()).select_from(QueueItem).where(
-            QueueItem.task_id == task.id,
-            QueueItem.status == QueueStatusEnum.published,
-            QueueItem.published_at >= round_start,
-        )
-    ) or 0
     next_pending = session.scalar(
         select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.pending).order_by(QueueItem.message_id.asc())
     )
@@ -386,11 +383,9 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
         f"状态: {'🟢运行中' if task.enabled else '⏸暂停'}\n"
         f"队列统计: 待发布 {stats['pending']} | 已发布 {stats['published']} | 失败 {stats['failed']} | 跳过 {stats['skipped']}\n"
         f"今日发布: {today_published}/{task.daily_limit}\n"
-        f"当前轮发布: {round_published}/{task.round_limit} (窗口{task.round_hours}h)\n"
         f"间隔: {task.interval_seconds}s\n"
         f"下次可发布剩余: {next_publish_in_seconds}s\n"
         f"日上限: {task.daily_limit}\n"
-        f"轮次: {task.round_hours}h / {task.round_limit}\n"
         f"时段: {task.active_start_time}-{task.active_end_time}\n"
         f"自动监听: {bool_cn(task.auto_capture_enabled)}\n"
         f"发布后删除源消息: {bool_cn(task.delete_after_success)}\n"
@@ -504,10 +499,6 @@ def reached_daily_limit(published_count: int, daily_limit: int) -> bool:
     return published_count >= daily_limit
 
 
-def reached_round_limit(published_count: int, round_limit: int) -> bool:
-    return published_count >= round_limit
-
-
 def extract_links(text: str) -> bool:
     return bool(re.search(r"https?://|t\.me/", text or "", flags=re.IGNORECASE))
 
@@ -575,16 +566,6 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
         ) or 0
         if reached_daily_limit(today_published, db_task.daily_limit):
             return "达到每日上限"
-        round_start = now() - timedelta(hours=db_task.round_hours)
-        round_published = session.scalar(
-            select(func.count()).select_from(QueueItem).where(
-                QueueItem.task_id == db_task.id,
-                QueueItem.status == QueueStatusEnum.published,
-                QueueItem.published_at >= round_start,
-            )
-        ) or 0
-        if reached_round_limit(round_published, db_task.round_limit):
-            return "达到轮次上限"
         if not ignore_interval and db_task.last_published_at:
             elapsed = (now() - db_task.last_published_at).total_seconds()
             if elapsed < db_task.interval_seconds:
@@ -622,28 +603,53 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     return f"已过滤 media_group={item.media_group_id} count={len(same_album)} ({group_reason})"
 
                 message_ids = [x.message_id for x in same_album]
-                if db_task.mode == TaskModeEnum.copy:
-                    sent_ids = await application.bot.copy_messages(
+                can_send_media_group = all(
+                    x.file_id and x.message_type in {"photo", "video", "document"} for x in same_album
+                )
+                sent_ids = []
+                if can_send_media_group:
+                    caption_text = next((x.caption for x in same_album if x.caption), None)
+                    media = []
+                    for idx, album_item in enumerate(same_album):
+                        caption = caption_text if idx == 0 else None
+                        if album_item.message_type == "photo":
+                            media.append(InputMediaPhoto(media=album_item.file_id, caption=caption))
+                        elif album_item.message_type == "video":
+                            media.append(InputMediaVideo(media=album_item.file_id, caption=caption))
+                        else:
+                            media.append(InputMediaDocument(media=album_item.file_id, caption=caption))
+                    sent_messages = await application.bot.send_media_group(
                         chat_id=db_task.target_chat_id,
-                        from_chat_id=db_task.source_chat_id,
-                        message_ids=message_ids,
+                        media=media,
                     )
+                    sent_ids = [m for m in sent_messages]
                 else:
-                    if hasattr(application.bot, "forward_messages"):
-                        sent_ids = await application.bot.forward_messages(
+                    if db_task.mode == TaskModeEnum.forward:
+                        fallback_action = "fallback_forward_messages_due_to_missing_file_id_may_split_album"
+                        write_log(session, db_task.id, item.message_id, None, "fallback", fallback_action)
+                        if hasattr(application.bot, "forward_messages"):
+                            sent_ids = await application.bot.forward_messages(
+                                chat_id=db_task.target_chat_id,
+                                from_chat_id=db_task.source_chat_id,
+                                message_ids=message_ids,
+                            )
+                        else:
+                            sent_ids = []
+                            for mid in message_ids:
+                                forwarded = await application.bot.forward_message(
+                                    chat_id=db_task.target_chat_id,
+                                    from_chat_id=db_task.source_chat_id,
+                                    message_id=mid,
+                                )
+                                sent_ids.append(forwarded)
+                    else:
+                        fallback_action = "fallback_copy_messages_due_to_missing_file_id_may_split_album"
+                        write_log(session, db_task.id, item.message_id, None, "fallback", fallback_action)
+                        sent_ids = await application.bot.copy_messages(
                             chat_id=db_task.target_chat_id,
                             from_chat_id=db_task.source_chat_id,
                             message_ids=message_ids,
                         )
-                    else:
-                        sent_ids = []
-                        for mid in message_ids:
-                            forwarded = await application.bot.forward_message(
-                                chat_id=db_task.target_chat_id,
-                                from_chat_id=db_task.source_chat_id,
-                                message_id=mid,
-                            )
-                            sent_ids.append(forwarded)
                 published_at = now()
                 for i, album_item in enumerate(same_album):
                     target_id = sent_ids[i].message_id if i < len(sent_ids) else None
@@ -814,7 +820,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/retry_failed 重试 failed 消息\n\n"
         "【设置】(admin/super)\n"
         "/set_interval <seconds> (必须 > 0)\n"
-        "/set_round <hours> <limit> (hours>0, limit>=0)\n"
         "/set_daily_limit <count> (count>=0)\n"
         "/set_time_window <HH:MM> <HH:MM>\n"
         "/set_mode copy|forward\n"
@@ -1077,32 +1082,6 @@ async def set_interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = await set_current_task_simple(update, context, "interval_seconds", seconds)
     if task_id:
         await update.message.reply_text(f"✅ 任务 {task_id} interval={seconds}")
-
-
-@require_admin
-async def set_round_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 2:
-        await update.message.reply_text("用法: /set_round <hours> <limit>")
-        return
-    try:
-        hours = parse_int(context.args[0], "hours")
-        limit = parse_int(context.args[1], "limit")
-    except ValueError as exc:
-        await update.message.reply_text(f"参数错误：{exc}\n用法: /set_round <hours> <limit>")
-        return
-    if hours <= 0 or limit < 0:
-        await update.message.reply_text("hours 必须 > 0，limit 必须 >= 0")
-        return
-    task = get_current_task(update.effective_user.id)
-    if not task:
-        await update.message.reply_text("请先 /use_task <task_id>")
-        return
-    with SessionLocal() as session:
-        db_task = session.get(Task, task.id)
-        db_task.round_hours = hours
-        db_task.round_limit = limit
-        session.commit()
-    await update.message.reply_text(f"✅ round={hours}h/{limit}")
 
 
 @require_admin
@@ -2035,12 +2014,16 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     source_chat_id = msg.chat_id
     text_value = msg.text or msg.caption or ""
     message_type = "text"
+    file_id = None
     if msg.photo:
         message_type = "photo"
+        file_id = msg.photo[-1].file_id if msg.photo else None
     elif msg.video:
         message_type = "video"
+        file_id = msg.video.file_id
     elif msg.document:
         message_type = "document"
+        file_id = msg.document.file_id
     elif msg.sticker:
         message_type = "sticker"
     elif msg.poll:
@@ -2057,6 +2040,8 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     message_id=msg.message_id,
                     status=QueueStatusEnum.pending,
                     message_type=message_type,
+                    file_id=file_id,
+                    caption=msg.caption,
                     text_preview=text_value[:280] if text_value else None,
                     has_text=bool(text_value),
                     has_photo=bool(msg.photo),
@@ -2137,6 +2122,14 @@ def init_db():
             t.active_start_time = "00:00"
             t.active_end_time = "23:59"
         session.commit()
+    # 轻量自迁移：为旧库补齐 queue 新字段（SQLite 允许 ADD COLUMN）
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("queue")}
+    with engine.begin() as conn:
+        if "file_id" not in columns:
+            conn.execute(sql_text("ALTER TABLE queue ADD COLUMN file_id VARCHAR(512)"))
+        if "caption" not in columns:
+            conn.execute(sql_text("ALTER TABLE queue ADD COLUMN caption TEXT"))
 
 
 def token_preview(token: str) -> str:
@@ -2175,7 +2168,6 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("skip", skip_cmd))
     app.add_handler(CommandHandler("retry_failed", retry_failed_cmd))
     app.add_handler(CommandHandler("set_interval", set_interval_cmd))
-    app.add_handler(CommandHandler("set_round", set_round_cmd))
     app.add_handler(CommandHandler("set_daily_limit", set_daily_limit_cmd))
     app.add_handler(CommandHandler("set_time_window", set_time_window_cmd))
     app.add_handler(CommandHandler("set_mode", set_mode_cmd))

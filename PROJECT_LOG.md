@@ -1,5 +1,28 @@
 # PROJECT_LOG
 
+## 2026-04-29
+
+### 已完成
+
+- 下线“轮次限制”功能（最小改动，保留数据库字段兼容历史数据）：
+  - 发布逻辑已不再执行 `round_hours/round_limit` 限制判断
+  - 任务详情已移除“当前轮发布/轮次”展示
+  - 移除 `/set_round` 帮助文案、命令处理器与 handler 注册入口
+  - `README.md` 常用命令示例移除 `/set_round`
+- 本轮改动文件：
+  - `main.py`
+  - `README.md`
+  - `PROJECT_LOG.md`
+
+### 已验证项
+
+- `python -m py_compile main.py` 通过
+- `pytest` 通过（22 passed）
+
+### 下一步建议（最高优先）
+
+- 为任务详情补充“最近发布日志预览（最近5条）”按钮，并沿用“界面保持+单独提示”交互规则。
+
 ## 2026-04-28
 
 ### 已完成
@@ -157,6 +180,21 @@
   - 成功逻辑保持整组落库：每条记录写 `published/target_message_id/publish_logs`
   - 新消息捕获补充 `document` 类型识别（用于媒体组元数据完整性）
   - 非媒体组消息发布逻辑保持不变
+- 媒体组“真正相册发布”增强（sendMediaGroup）：
+  - `queue` 增加字段：`file_id`、`caption`（并在启动时对旧库做 `ALTER TABLE` 轻量补字段）
+  - 新消息监听落库媒体 file_id：
+    - `photo` 取 `photo[-1].file_id`
+    - `video` 取 `video.file_id`
+    - `document` 取 `document.file_id`
+    - `caption` 同步存储
+  - 对同 `media_group_id` 的 pending：
+    - 若组内均有 `file_id` 且类型在 `photo/video/document`，使用 `send_media_group` 真正合并发送
+    - caption 仅放第一条（其余为空）
+  - `send_media_group` 成功后：按返回顺序回写每条 `target_message_id`，并整组标记 `published` + 写发布日志
+  - 若组内缺 `file_id`（典型为 `/import_range` 历史消息）：
+    - `copy` 模式 fallback 到 `copy_messages`，记录 `fallback_copy_messages_due_to_missing_file_id_may_split_album`
+    - `forward` 模式 fallback 到 `forward_messages`（不支持则逐条 `forward_message`），记录 `fallback_forward_messages_due_to_missing_file_id_may_split_album`
+  - 组过滤保持“任意一条不符合即整组 skip”，组失败保持“任意异常即整组 failed”
 
 ### 当前状态
 
@@ -199,6 +237,7 @@
 - 本轮数据持久化默认路径优化后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮时段与手动发布认知修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（14 passed）
 - 本轮媒体组合并发布能力补全后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（18 passed）
+- 本轮媒体组 sendMediaGroup 增强后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（22 passed）
 
 ### 下一步建议（最高优先）
 

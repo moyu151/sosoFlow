@@ -107,7 +107,6 @@ pytest
 /import_range 100 120
 /publish_now
 /set_interval 1800
-/set_round 6 20
 /set_daily_limit 100
 /set_time_window 09:00 23:30
 /set_mode copy

@@ -16,7 +16,6 @@ from main import (
     parse_int,
     parse_on_off,
     reached_daily_limit,
-    reached_round_limit,
 )
 
 
@@ -98,8 +97,6 @@ def test_is_time_in_window_cross_midnight():
 def test_limit_helpers():
     assert reached_daily_limit(10, 10) is True
     assert reached_daily_limit(9, 10) is False
-    assert reached_round_limit(20, 20) is True
-    assert reached_round_limit(19, 20) is False
 
 
 def test_album_like_single_photo_filter_pass():
