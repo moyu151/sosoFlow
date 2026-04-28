@@ -55,6 +55,10 @@
   - 处理：将 `callback_handler` 中所有页面切换相关编辑统一替换为 `edit_query_message_text_or_caption`
   - 覆盖场景：`task_view`、`task_start`、`task_pause`、`task_settings`、过滤页、删除后回流等
   - 结果：不再依赖消息类型，图片/文本消息都可稳定跳转；编辑失败时仍可自动回退新消息发送
+- 修复 PostgreSQL 旧库枚举缺失 `waiting` 导致详情页/状态查询报错：
+  - 现象：查询 `queue.status='waiting'` 时抛异常，导致任务详情打不开
+  - 根因：旧库中 `queue.status` 的枚举类型未包含新值 `waiting`
+  - 处理：`init_db` 在 PostgreSQL 启动时执行枚举自迁移，自动为现有状态枚举追加 `waiting`（`ADD VALUE IF NOT EXISTS`）
 - 本轮改动文件：
   - `main.py`
   - `README.md`

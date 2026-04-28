@@ -2306,6 +2306,28 @@ async def post_init_hook(application: Application):
 def init_db():
     os.makedirs("/mnt/sosoflow", exist_ok=True)
     Base.metadata.create_all(engine)
+    # PostgreSQL 枚举自迁移：补齐 queue.status 的 waiting 枚举值（兼容旧库）
+    if database_type(env.database_url) == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(
+                sql_text(
+                    """
+                    DO $$
+                    DECLARE enum_name text;
+                    BEGIN
+                        SELECT t.typname INTO enum_name
+                        FROM pg_type t
+                        JOIN pg_enum e ON t.oid = e.enumtypid
+                        WHERE e.enumlabel = 'pending'
+                        LIMIT 1;
+                        IF enum_name IS NOT NULL THEN
+                            EXECUTE format('ALTER TYPE %I ADD VALUE IF NOT EXISTS %L', enum_name, 'waiting');
+                        END IF;
+                    END
+                    $$;
+                    """
+                )
+            )
     with SessionLocal() as session:
         setting = session.get(GlobalSetting, 1)
         if not setting:
