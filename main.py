@@ -1426,6 +1426,14 @@ def upsert_queue_item_from_capture(
 def requeue_edited_items_for_task(session, task: Task) -> int:
     if not task.recapture_on_edit_enabled:
         return 0
+    candidate_exists = session.scalar(
+        select(func.count()).select_from(QueueItem).where(
+            QueueItem.task_id == task.id,
+            QueueItem.status.in_([QueueStatusEnum.published, QueueStatusEnum.skipped]),
+        )
+    ) or 0
+    if candidate_exists == 0:
+        return 0
     q = (
         select(QueueItem, SourceMessage)
         .join(
@@ -2643,7 +2651,10 @@ async def start_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if db_task:
                 db_task.is_completed = False
                 db_task.completed_at = None
-                requeued = requeue_edited_items_for_task(session, db_task)
+                try:
+                    requeued = requeue_edited_items_for_task(session, db_task)
+                except Exception as exc:
+                    logger.exception("start_task recapture scan failed task_id=%s err=%s", task_id, exc)
                 write_config_log(session, task_id, "手动启动任务")
                 session.commit()
         if requeued > 0:
@@ -2886,7 +2897,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task.enabled = True
             task.is_completed = False
             task.completed_at = None
-            requeued = requeue_edited_items_for_task(session, task)
+            requeued = 0
+            try:
+                requeued = requeue_edited_items_for_task(session, task)
+            except Exception as exc:
+                logger.exception("task_start recapture scan failed task_id=%s err=%s", task.id, exc)
             write_config_log(session, task.id, "按钮启动任务")
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
