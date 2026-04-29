@@ -68,6 +68,20 @@ class QueueStatusEnum(str, Enum):
     waiting = "waiting"
 
 
+class SourceMessageStateEnum(str, Enum):
+    observed = "observed"
+    missing = "missing"
+    deleted = "deleted"
+
+
+class TaskMessageStatusEnum(str, Enum):
+    pending = "pending"
+    published = "published"
+    failed = "failed"
+    skipped = "skipped"
+    waiting = "waiting"
+
+
 class Admin(Base):
     __tablename__ = "admins"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -157,6 +171,55 @@ class PublishLog(Base):
     action: Mapped[str] = mapped_column(String(20))
     message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class SourceRegistry(Base):
+    __tablename__ = "source_registry"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    latest_seen_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class SourceMessage(Base):
+    __tablename__ = "source_messages"
+    __table_args__ = (UniqueConstraint("source_chat_id", "message_id", name="uq_source_msg"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    state: Mapped[SourceMessageStateEnum] = mapped_column(SqlEnum(SourceMessageStateEnum), default=SourceMessageStateEnum.observed)
+    message_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    file_id: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    text_preview: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    has_text: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    has_photo: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    has_video: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    has_document: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    has_links: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    is_forwarded: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    media_group_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class TaskMessageState(Base):
+    __tablename__ = "task_message_state"
+    __table_args__ = (UniqueConstraint("task_id", "source_chat_id", "message_id", name="uq_task_source_msg"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
+    source_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    status: Mapped[TaskMessageStatusEnum] = mapped_column(SqlEnum(TaskMessageStatusEnum), default=TaskMessageStatusEnum.pending)
+    target_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    fail_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
 class GlobalSetting(Base):
@@ -413,6 +476,90 @@ def get_or_create_task_by_pair(session, source_chat_id: int, target_chat_id: int
     return task, True
 
 
+def ensure_auto_source_capture_task(session, source_chat_id: int) -> Task:
+    existing = session.scalar(select(Task).where(Task.source_chat_id == source_chat_id).order_by(Task.id.asc()))
+    if existing:
+        return existing
+    task = Task(
+        name=f"auto_source_{abs(source_chat_id)}",
+        source_chat_id=source_chat_id,
+        # 默认目标先占位为 source，任务默认暂停，不会误发布；管理员后续改目标后再启动。
+        target_chat_id=source_chat_id,
+        enabled=False,
+        auto_capture_enabled=True,
+    )
+    session.add(task)
+    session.commit()
+    session.refresh(task)
+    session.add(TaskFilter(task_id=task.id))
+    session.commit()
+    logger.info("auto_source_task_created task_id=%s source_chat_id=%s", task.id, source_chat_id)
+    return task
+
+
+def upsert_source_registry_and_message(
+    session,
+    source_chat_id: int,
+    message_id: int,
+    message_type: str,
+    file_id: Optional[str],
+    caption: Optional[str],
+    text_value: str,
+    has_photo: bool,
+    has_video: bool,
+    has_document: bool,
+    is_forwarded: bool,
+    media_group_id: Optional[str],
+):
+    registry = session.scalar(select(SourceRegistry).where(SourceRegistry.source_chat_id == source_chat_id))
+    if not registry:
+        registry = SourceRegistry(source_chat_id=source_chat_id, enabled=True, latest_seen_message_id=message_id)
+        session.add(registry)
+    else:
+        if registry.latest_seen_message_id is None or message_id > registry.latest_seen_message_id:
+            registry.latest_seen_message_id = message_id
+    row = session.scalar(select(SourceMessage).where(SourceMessage.source_chat_id == source_chat_id, SourceMessage.message_id == message_id))
+    if row:
+        row.state = SourceMessageStateEnum.observed
+        row.message_type = message_type
+        row.file_id = file_id
+        row.caption = caption
+        row.text_preview = text_value[:280] if text_value else None
+        row.has_text = bool(text_value)
+        row.has_photo = has_photo
+        row.has_video = has_video
+        row.has_document = has_document
+        row.has_links = extract_links(text_value)
+        row.is_forwarded = is_forwarded
+        row.media_group_id = media_group_id
+        return
+    session.add(
+        SourceMessage(
+            source_chat_id=source_chat_id,
+            message_id=message_id,
+            state=SourceMessageStateEnum.observed,
+            message_type=message_type,
+            file_id=file_id,
+            caption=caption,
+            text_preview=text_value[:280] if text_value else None,
+            has_text=bool(text_value),
+            has_photo=has_photo,
+            has_video=has_video,
+            has_document=has_document,
+            has_links=extract_links(text_value),
+            is_forwarded=is_forwarded,
+            media_group_id=media_group_id,
+        )
+    )
+
+
+def is_source_enabled(session, source_chat_id: int) -> bool:
+    row = session.scalar(select(SourceRegistry).where(SourceRegistry.source_chat_id == source_chat_id))
+    if not row:
+        return True
+    return bool(row.enabled)
+
+
 def ensure_task_filter(session, task_id: int) -> TaskFilter:
     task_filter = session.scalar(select(TaskFilter).where(TaskFilter.task_id == task_id))
     if task_filter:
@@ -432,6 +579,51 @@ def task_stats(session, task_id: int) -> dict[str, int]:
     return data
 
 
+def task_message_stats(session, task: Task) -> dict[str, int]:
+    data = {}
+    for status in [
+        TaskMessageStatusEnum.pending,
+        TaskMessageStatusEnum.waiting,
+        TaskMessageStatusEnum.published,
+        TaskMessageStatusEnum.failed,
+        TaskMessageStatusEnum.skipped,
+    ]:
+        query = select(func.count()).select_from(TaskMessageState).where(
+            TaskMessageState.task_id == task.id,
+            TaskMessageState.source_chat_id == task.source_chat_id,
+            TaskMessageState.status == status,
+        )
+        if has_task_range(task):
+            query = query.where(
+                TaskMessageState.message_id >= task.range_start_message_id,
+                TaskMessageState.message_id <= task.range_end_message_id,
+            )
+        count = session.scalar(query) or 0
+        data[status.value] = count
+    return data
+
+
+def today_published_count(session, task: Task) -> int:
+    today_start = datetime.combine(now().date(), time.min)
+    if has_task_range(task):
+        return session.scalar(
+            select(func.count()).select_from(TaskMessageState).where(
+                TaskMessageState.task_id == task.id,
+                TaskMessageState.source_chat_id == task.source_chat_id,
+                TaskMessageState.status == TaskMessageStatusEnum.published,
+                TaskMessageState.published_at.is_not(None),
+                TaskMessageState.published_at >= today_start,
+            )
+        ) or 0
+    return session.scalar(
+        select(func.count()).select_from(QueueItem).where(
+            QueueItem.task_id == task.id,
+            QueueItem.status == QueueStatusEnum.published,
+            QueueItem.published_at >= today_start,
+        )
+    ) or 0
+
+
 def task_publish_unit_stats(session, task_id: int) -> tuple[int, int]:
     pending_single = session.scalar(
         select(func.count()).select_from(QueueItem).where(
@@ -448,6 +640,40 @@ def task_publish_unit_stats(session, task_id: int) -> tuple[int, int]:
         )
     ) or 0
     return pending_single, pending_groups
+
+
+def task_publish_unit_stats_v2(session, task: Task) -> tuple[int, int]:
+    if not has_task_range(task):
+        return task_publish_unit_stats(session, task.id)
+    pending_rows = session.scalars(
+        select(TaskMessageState).where(
+            TaskMessageState.task_id == task.id,
+            TaskMessageState.source_chat_id == task.source_chat_id,
+            TaskMessageState.message_id >= task.range_start_message_id,
+            TaskMessageState.message_id <= task.range_end_message_id,
+            TaskMessageState.status == TaskMessageStatusEnum.pending,
+        )
+    ).all()
+    if not pending_rows:
+        return 0, 0
+    pending_ids = [x.message_id for x in pending_rows]
+    grouped_pending = session.scalar(
+        select(func.count(func.distinct(SourceMessage.media_group_id))).where(
+            SourceMessage.source_chat_id == task.source_chat_id,
+            SourceMessage.message_id.in_(pending_ids),
+            SourceMessage.state == SourceMessageStateEnum.observed,
+            SourceMessage.media_group_id.is_not(None),
+        )
+    ) or 0
+    single_pending = session.scalar(
+        select(func.count()).select_from(SourceMessage).where(
+            SourceMessage.source_chat_id == task.source_chat_id,
+            SourceMessage.message_id.in_(pending_ids),
+            SourceMessage.state == SourceMessageStateEnum.observed,
+            SourceMessage.media_group_id.is_(None),
+        )
+    ) or 0
+    return single_pending, grouped_pending
 
 
 def filter_summary(task_filter: TaskFilter) -> str:
@@ -490,17 +716,10 @@ async def resolve_chat_display_name(application: Application, chat_id: int) -> O
 
 
 def build_task_detail_text(session, task: Task, source_name: Optional[str] = None, target_name: Optional[str] = None) -> str:
-    stats = task_stats(session, task.id)
-    pending_single_units, pending_group_units = task_publish_unit_stats(session, task.id)
+    stats = task_message_stats(session, task) if has_task_range(task) else task_stats(session, task.id)
+    pending_single_units, pending_group_units = task_publish_unit_stats_v2(session, task)
     task_filter = ensure_task_filter(session, task.id)
-    today_start = datetime.combine(now().date(), time.min)
-    today_published = session.scalar(
-        select(func.count()).select_from(QueueItem).where(
-            QueueItem.task_id == task.id,
-            QueueItem.status == QueueStatusEnum.published,
-            QueueItem.published_at >= today_start,
-        )
-    ) or 0
+    today_published = today_published_count(session, task)
     next_pending = session.scalar(
         select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.pending).order_by(QueueItem.message_id.asc())
     )
@@ -545,10 +764,9 @@ def task_detail_keyboard(task_id: int):
             [InlineKeyboardButton("▶️ 启动", callback_data=f"task_start:{task_id}"), InlineKeyboardButton("⏸ 暂停", callback_data=f"task_pause:{task_id}")],
             [InlineKeyboardButton("🚀 立即发布", callback_data=f"task_publish:{task_id}"), InlineKeyboardButton("📥 导入范围", callback_data=f"task_import_hint:{task_id}")],
             [InlineKeyboardButton("⚙️ 设置", callback_data=f"task_settings:{task_id}"), InlineKeyboardButton("🔁 重试失败", callback_data=f"task_retry:{task_id}")],
-            [InlineKeyboardButton("🔄 刷新", callback_data=f"task_view:{task_id}")],
-            [InlineKeyboardButton("♻️ 重置任务", callback_data=f"task_reset_ask:{task_id}")],
-            [InlineKeyboardButton("🗑 删除任务", callback_data=f"task_delete_ask:{task_id}")],
-            [InlineKeyboardButton("⬅️ 返回任务列表", callback_data="tasks_list")],
+            [InlineKeyboardButton("🧾 最近日志(5条)", callback_data=f"task_recent_logs:{task_id}"), InlineKeyboardButton("🔄 刷新", callback_data=f"task_view:{task_id}")],
+            [InlineKeyboardButton("♻️ 重置任务", callback_data=f"task_reset_ask:{task_id}"), InlineKeyboardButton("🗑 删除任务", callback_data=f"task_delete_ask:{task_id}")],
+            [InlineKeyboardButton("⬅️ 返回任务列表", callback_data="tasks_list"), InlineKeyboardButton("🏠 主菜单", callback_data="menu_home")],
         ]
     )
 
@@ -573,7 +791,7 @@ def task_settings_keyboard(task: Task):
                 InlineKeyboardButton("🔍 过滤设置", callback_data=f"task_filters:{task.id}"),
                 InlineKeyboardButton("⬅️ 返回任务详情", callback_data=f"task_view:{task.id}"),
             ],
-            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
+            [InlineKeyboardButton("📋 任务列表", callback_data="tasks_list"), InlineKeyboardButton("🏠 主菜单", callback_data="menu_home")],
         ]
     )
 
@@ -622,8 +840,7 @@ def task_filters_keyboard(task_id: int, task_filter: TaskFilter):
                 InlineKeyboardButton("max=300", callback_data=f"task_filter_max:{task_id}:300"),
                 InlineKeyboardButton("max=关闭", callback_data=f"task_filter_max_off:{task_id}"),
             ],
-            [InlineKeyboardButton("⬅️ 返回任务设置", callback_data=f"task_settings:{task_id}")],
-            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
+            [InlineKeyboardButton("⬅️ 返回任务设置", callback_data=f"task_settings:{task_id}"), InlineKeyboardButton("🏠 主菜单", callback_data="menu_home")],
         ]
     )
 
@@ -681,6 +898,10 @@ def write_log(session, task_id: int, source_message_id: Optional[int], target_me
             message=message,
         )
     )
+
+
+def write_config_log(session, task_id: int, message: str):
+    write_log(session, task_id, None, None, "config", message)
 
 
 def get_publish_unit_rows(session, base_item: QueueItem) -> list[QueueItem]:
@@ -749,8 +970,208 @@ def mark_item_waiting_or_failed(session, db_task: Task, queue_item: QueueItem, f
     write_log(session, db_task.id, queue_item.message_id, None, "waiting", fail_msg)
 
 
+def to_task_message_status(status: QueueStatusEnum) -> TaskMessageStatusEnum:
+    mapping = {
+        QueueStatusEnum.pending: TaskMessageStatusEnum.pending,
+        QueueStatusEnum.published: TaskMessageStatusEnum.published,
+        QueueStatusEnum.failed: TaskMessageStatusEnum.failed,
+        QueueStatusEnum.skipped: TaskMessageStatusEnum.skipped,
+        QueueStatusEnum.waiting: TaskMessageStatusEnum.waiting,
+    }
+    return mapping[status]
+
+
+def to_queue_status(status: TaskMessageStatusEnum) -> QueueStatusEnum:
+    mapping = {
+        TaskMessageStatusEnum.pending: QueueStatusEnum.pending,
+        TaskMessageStatusEnum.published: QueueStatusEnum.published,
+        TaskMessageStatusEnum.failed: QueueStatusEnum.failed,
+        TaskMessageStatusEnum.skipped: QueueStatusEnum.skipped,
+        TaskMessageStatusEnum.waiting: QueueStatusEnum.waiting,
+    }
+    return mapping[status]
+
+
+def upsert_task_message_state_from_queue_item(session, task_id: int, source_chat_id: int, item: QueueItem):
+    row = session.scalar(
+        select(TaskMessageState).where(
+            TaskMessageState.task_id == task_id,
+            TaskMessageState.source_chat_id == source_chat_id,
+            TaskMessageState.message_id == item.message_id,
+        )
+    )
+    mapped_status = to_task_message_status(item.status)
+    if not row:
+        session.add(
+            TaskMessageState(
+                task_id=task_id,
+                source_chat_id=source_chat_id,
+                message_id=item.message_id,
+                status=mapped_status,
+                target_message_id=item.target_message_id,
+                fail_reason=item.fail_reason,
+                retry_count=item.retry_count or 0,
+                next_retry_at=item.next_retry_at,
+                published_at=item.published_at,
+            )
+        )
+        return
+    row.status = mapped_status
+    row.target_message_id = item.target_message_id
+    row.fail_reason = item.fail_reason
+    row.retry_count = item.retry_count or 0
+    row.next_retry_at = item.next_retry_at
+    row.published_at = item.published_at
+
+
+def is_terminal_tms_status(status: TaskMessageStatusEnum) -> bool:
+    return status in {TaskMessageStatusEnum.published, TaskMessageStatusEnum.failed, TaskMessageStatusEnum.skipped}
+
+
+async def try_delete_source_message_if_ready(application: Application, session, source_chat_id: int, message_id: int) -> tuple[bool, str]:
+    tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id)).all()
+    if not tasks:
+        return False, "no_tasks"
+    delete_required = any(t.delete_after_success for t in tasks)
+    if not delete_required:
+        return False, "delete_not_required"
+    for t in tasks:
+        # 仅检查会消费该源的任务，已彻底关闭自动监听的任务不参与删源门槛。
+        if not t.auto_capture_enabled:
+            continue
+        tms = session.scalar(
+            select(TaskMessageState).where(
+                TaskMessageState.task_id == t.id,
+                TaskMessageState.source_chat_id == source_chat_id,
+                TaskMessageState.message_id == message_id,
+            )
+        )
+        if not tms:
+            return False, f"task_{t.id}_no_state"
+        if not is_terminal_tms_status(tms.status):
+            return False, f"task_{t.id}_not_terminal:{tms.status.value}"
+    try:
+        await application.bot.delete_message(chat_id=source_chat_id, message_id=message_id)
+    except Exception as exc:
+        return False, f"delete_fail:{exc}"
+    now_ts = now()
+    queue_rows = session.scalars(
+        select(QueueItem).join(Task, QueueItem.task_id == Task.id).where(
+            Task.source_chat_id == source_chat_id,
+            QueueItem.message_id == message_id,
+        )
+    ).all()
+    for row in queue_rows:
+        row.deleted_at = now_ts
+    for t in tasks:
+        write_log(session, t.id, message_id, None, "delete", "删除源消息成功（按多任务门槛）")
+    session.commit()
+    return True, "deleted"
+
+
+def ensure_queue_item_for_task_message(session, task: Task, tms: TaskMessageState) -> Optional[QueueItem]:
+    item = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == tms.message_id))
+    if item:
+        item.status = to_queue_status(tms.status)
+        item.retry_count = tms.retry_count or 0
+        item.next_retry_at = tms.next_retry_at
+        item.fail_reason = tms.fail_reason
+        item.target_message_id = tms.target_message_id
+        item.published_at = tms.published_at
+        return item
+    src = session.scalar(
+        select(SourceMessage).where(
+            SourceMessage.source_chat_id == task.source_chat_id,
+            SourceMessage.message_id == tms.message_id,
+            SourceMessage.state == SourceMessageStateEnum.observed,
+        )
+    )
+    if not src:
+        return None
+    item = QueueItem(
+        task_id=task.id,
+        message_id=src.message_id,
+        status=to_queue_status(tms.status),
+        target_message_id=tms.target_message_id,
+        message_type=src.message_type or "unknown",
+        file_id=src.file_id,
+        caption=src.caption,
+        text_preview=src.text_preview,
+        has_text=src.has_text,
+        has_photo=src.has_photo,
+        has_video=src.has_video,
+        has_document=src.has_document,
+        has_links=src.has_links,
+        is_forwarded=src.is_forwarded,
+        media_group_id=src.media_group_id,
+        published_at=tms.published_at,
+        fail_reason=tms.fail_reason,
+        retry_count=tms.retry_count or 0,
+        next_retry_at=tms.next_retry_at,
+    )
+    session.add(item)
+    return item
+
+
 def pick_next_publish_item(session, task_id: int) -> Optional[QueueItem]:
     task = session.get(Task, task_id)
+    if task and has_task_range(task):
+        pending_tms_rows = session.scalars(
+            select(TaskMessageState).where(
+                TaskMessageState.task_id == task_id,
+                TaskMessageState.source_chat_id == task.source_chat_id,
+                TaskMessageState.message_id >= task.range_start_message_id,
+                TaskMessageState.message_id <= task.range_end_message_id,
+                TaskMessageState.status == TaskMessageStatusEnum.pending,
+            ).order_by(TaskMessageState.message_id.asc())
+        ).all()
+        for pending_tms in pending_tms_rows:
+            candidate = ensure_queue_item_for_task_message(session, task, pending_tms)
+            if candidate:
+                return candidate
+            pending_tms.status = TaskMessageStatusEnum.failed
+            pending_tms.fail_reason = "源消息未观测或已删除，无法构建发布载荷"
+        waiting_tms_rows = session.scalars(
+            select(TaskMessageState).where(
+                TaskMessageState.task_id == task_id,
+                TaskMessageState.source_chat_id == task.source_chat_id,
+                TaskMessageState.message_id >= task.range_start_message_id,
+                TaskMessageState.message_id <= task.range_end_message_id,
+                TaskMessageState.status == TaskMessageStatusEnum.waiting,
+                TaskMessageState.next_retry_at.is_not(None),
+                TaskMessageState.next_retry_at <= now(),
+            ).order_by(TaskMessageState.message_id.asc())
+        ).all()
+        for waiting_tms in waiting_tms_rows:
+            candidate = ensure_queue_item_for_task_message(session, task, waiting_tms)
+            if candidate:
+                return candidate
+            waiting_tms.status = TaskMessageStatusEnum.failed
+            waiting_tms.fail_reason = "源消息未观测或已删除，无法构建发布载荷"
+            waiting_tms.next_retry_at = None
+        if pending_tms_rows or waiting_tms_rows:
+            session.commit()
+        # 兼容过渡：若 task_message_state 尚未建全，回退到旧 queue 选择。
+        fallback_pending = session.scalar(
+            select(QueueItem).where(
+                QueueItem.task_id == task_id,
+                QueueItem.message_id >= task.range_start_message_id,
+                QueueItem.message_id <= task.range_end_message_id,
+                QueueItem.status == QueueStatusEnum.pending,
+            ).order_by(QueueItem.message_id.asc())
+        )
+        if fallback_pending:
+            return fallback_pending
+        return session.scalar(
+            select(QueueItem).where(
+                QueueItem.task_id == task_id,
+                QueueItem.message_id >= task.range_start_message_id,
+                QueueItem.message_id <= task.range_end_message_id,
+                QueueItem.status == QueueStatusEnum.waiting,
+                QueueItem.next_retry_at.is_not(None),
+                QueueItem.next_retry_at <= now(),
+            ).order_by(QueueItem.message_id.asc())
+        )
     range_start = task.range_start_message_id if task else None
     range_end = task.range_end_message_id if task else None
     base_pending = select(QueueItem).where(QueueItem.task_id == task_id, QueueItem.status == QueueStatusEnum.pending)
@@ -797,11 +1218,12 @@ def try_auto_complete_task_range(session, task: Task) -> bool:
     if not has_task_range(task):
         return False
     unfinished = session.scalar(
-        select(func.count()).select_from(QueueItem).where(
-            QueueItem.task_id == task.id,
-            QueueItem.message_id >= task.range_start_message_id,
-            QueueItem.message_id <= task.range_end_message_id,
-            QueueItem.status.in_([QueueStatusEnum.pending, QueueStatusEnum.waiting]),
+        select(func.count()).select_from(TaskMessageState).where(
+            TaskMessageState.task_id == task.id,
+            TaskMessageState.source_chat_id == task.source_chat_id,
+            TaskMessageState.message_id >= task.range_start_message_id,
+            TaskMessageState.message_id <= task.range_end_message_id,
+            TaskMessageState.status.in_([TaskMessageStatusEnum.pending, TaskMessageStatusEnum.waiting]),
         )
     ) or 0
     if unfinished > 0:
@@ -811,6 +1233,78 @@ def try_auto_complete_task_range(session, task: Task) -> bool:
     finalize_task_as_completed(session, task, "范围消息处理完成，任务自动停止")
     session.commit()
     return True
+
+
+def sync_task_range_queue_from_source_messages(session, task: Task) -> tuple[int, int]:
+    if not has_task_range(task):
+        return 0, 0
+    src_rows = session.scalars(
+        select(SourceMessage).where(
+            SourceMessage.source_chat_id == task.source_chat_id,
+            SourceMessage.state == SourceMessageStateEnum.observed,
+            SourceMessage.message_id >= task.range_start_message_id,
+            SourceMessage.message_id <= task.range_end_message_id,
+        )
+    ).all()
+    inserted = 0
+    existed = 0
+    for src in src_rows:
+        tms = session.scalar(
+            select(TaskMessageState).where(
+                TaskMessageState.task_id == task.id,
+                TaskMessageState.source_chat_id == task.source_chat_id,
+                TaskMessageState.message_id == src.message_id,
+            )
+        )
+        if not tms:
+            session.add(
+                TaskMessageState(
+                    task_id=task.id,
+                    source_chat_id=task.source_chat_id,
+                    message_id=src.message_id,
+                    status=TaskMessageStatusEnum.pending,
+                )
+            )
+        exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == src.message_id))
+        if exists:
+            existed += 1
+            if exists.status in {QueueStatusEnum.pending, QueueStatusEnum.waiting, QueueStatusEnum.failed}:
+                # 持续补全元数据，保障媒体组信息完整。
+                exists.message_type = src.message_type or exists.message_type
+                exists.file_id = src.file_id or exists.file_id
+                exists.caption = src.caption if src.caption is not None else exists.caption
+                exists.text_preview = src.text_preview if src.text_preview is not None else exists.text_preview
+                exists.has_text = src.has_text if src.has_text is not None else exists.has_text
+                exists.has_photo = src.has_photo if src.has_photo is not None else exists.has_photo
+                exists.has_video = src.has_video if src.has_video is not None else exists.has_video
+                exists.has_document = src.has_document if src.has_document is not None else exists.has_document
+                exists.has_links = src.has_links if src.has_links is not None else exists.has_links
+                exists.is_forwarded = src.is_forwarded if src.is_forwarded is not None else exists.is_forwarded
+                exists.media_group_id = src.media_group_id or exists.media_group_id
+            upsert_task_message_state_from_queue_item(session, task.id, task.source_chat_id, exists)
+            continue
+        new_item = QueueItem(
+            task_id=task.id,
+            message_id=src.message_id,
+            message_type=src.message_type or "unknown",
+            file_id=src.file_id,
+            caption=src.caption,
+            text_preview=src.text_preview,
+            has_text=src.has_text,
+            has_photo=src.has_photo,
+            has_video=src.has_video,
+            has_document=src.has_document,
+            has_links=src.has_links,
+            is_forwarded=src.is_forwarded,
+            media_group_id=src.media_group_id,
+            status=QueueStatusEnum.pending,
+        )
+        session.add(new_item)
+        upsert_task_message_state_from_queue_item(session, task.id, task.source_chat_id, new_item)
+        inserted += 1
+    if inserted > 0:
+        session.commit()
+    return inserted, existed
 
 
 def add_bot_to_chat_keyboard(application: Application) -> Optional[InlineKeyboardMarkup]:
@@ -886,18 +1380,12 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
         db_task = session.get(Task, task.id)
         if not db_task:
             return "任务不存在"
+        sync_task_range_queue_from_source_messages(session, db_task)
         if try_auto_complete_task_range(session, db_task):
             return "范围消息处理完成，任务已自动停止"
         if not ignore_window and not in_time_window(db_task):
             return "不在允许时间段"
-        today_start = datetime.combine(now().date(), time.min)
-        today_published = session.scalar(
-            select(func.count()).select_from(QueueItem).where(
-                QueueItem.task_id == db_task.id,
-                QueueItem.status == QueueStatusEnum.published,
-                QueueItem.published_at >= today_start,
-            )
-        ) or 0
+        today_published = today_published_count(session, db_task)
         if reached_daily_limit(today_published, db_task.daily_limit):
             return "达到每日上限"
         if not ignore_interval and db_task.last_published_at:
@@ -945,6 +1433,7 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                         album_item.next_retry_at = None
                         album_item.filter_reason = group_reason
                         write_log(session, db_task.id, album_item.message_id, None, "filter", group_reason)
+                        upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, album_item)
                     session.commit()
                     return f"已过滤 media_group={item.media_group_id} count={len(publish_unit_rows)} ({group_reason})"
 
@@ -991,15 +1480,17 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     album_item.fail_reason = None
                     album_item.next_retry_at = None
                     write_log(session, db_task.id, album_item.message_id, target_id, "publish", f"发布成功 publish_method={publish_method}")
-                    if db_task.delete_after_success:
-                        try:
-                            await application.bot.delete_message(chat_id=db_task.source_chat_id, message_id=album_item.message_id)
-                            album_item.deleted_at = now()
-                            write_log(session, db_task.id, album_item.message_id, target_id, "delete", "删除源消息成功")
-                        except Exception as delete_exc:
-                            msg = f"删除失败: {delete_exc}"
-                            album_item.fail_reason = msg
-                            write_log(session, db_task.id, album_item.message_id, target_id, "fail", msg)
+                    upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, album_item)
+                if db_task.delete_after_success:
+                    for album_item in publish_unit_rows:
+                        deleted, reason = await try_delete_source_message_if_ready(
+                            application=application,
+                            session=session,
+                            source_chat_id=db_task.source_chat_id,
+                            message_id=album_item.message_id,
+                        )
+                        if not deleted:
+                            write_log(session, db_task.id, album_item.message_id, None, "delete_defer", f"暂不删源: {reason}")
                 db_task.last_published_at = published_at
                 session.commit()
                 return f"发布成功 media_group={item.media_group_id} count={len(publish_unit_rows)} method={publish_method}"
@@ -1010,6 +1501,7 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                 item.next_retry_at = None
                 item.filter_reason = reason
                 write_log(session, db_task.id, item.message_id, None, "filter", reason)
+                upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, item)
                 session.commit()
                 return f"已过滤 message_id={item.message_id} ({reason})"
             if db_task.mode == TaskModeEnum.copy:
@@ -1026,14 +1518,15 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
             db_task.last_published_at = now()
             write_log(session, db_task.id, item.message_id, target_id, "publish", "发布成功")
             if db_task.delete_after_success:
-                try:
-                    await application.bot.delete_message(chat_id=db_task.source_chat_id, message_id=item.message_id)
-                    item.deleted_at = now()
-                    write_log(session, db_task.id, item.message_id, target_id, "delete", "删除源消息成功")
-                except Exception as delete_exc:
-                    msg = f"删除失败: {delete_exc}"
-                    item.fail_reason = msg
-                    write_log(session, db_task.id, item.message_id, target_id, "fail", msg)
+                deleted, reason = await try_delete_source_message_if_ready(
+                    application=application,
+                    session=session,
+                    source_chat_id=db_task.source_chat_id,
+                    message_id=item.message_id,
+                )
+                if not deleted:
+                    write_log(session, db_task.id, item.message_id, None, "delete_defer", f"暂不删源: {reason}")
+            upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, item)
             session.commit()
             return f"发布成功 message_id={item.message_id}"
         except Exception as exc:
@@ -1054,6 +1547,7 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                         album_item.fail_reason = fail_msg
                         album_item.next_retry_at = None
                         write_log(session, db_task.id, album_item.message_id, None, "fail", fail_msg)
+                    upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, album_item)
             else:
                 if should_waiting:
                     mark_item_waiting_or_failed(session, db_task, item, fail_msg)
@@ -1062,6 +1556,7 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     item.fail_reason = fail_msg
                     item.next_retry_at = None
                     write_log(session, db_task.id, item.message_id, None, "fail", fail_msg)
+                upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, item)
             session.commit()
             if should_waiting:
                 if is_media_group_unit:
@@ -1171,47 +1666,54 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_admin
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📘 sosoFlow 帮助\n\n"
-        "【通用】(admin/super)\n"
-        "/start 主菜单（带封面）\n"
-        "/help 查看本帮助\n"
-        "/status 系统状态\n\n"
-        "【任务】(admin/super)\n"
-        "/add_task <name> <source_chat_id> <target_chat_id> 新建任务（命令方式）\n"
-        "/tasks 查看任务列表\n"
-        "/use_task <task_id> 选择当前任务\n"
-        "/task_status 当前任务详情\n"
-        "/delete_task <task_id> 删除(二次确认)\n\n"
-        "【队列】(admin/super)\n"
-        f"/import_range <start_message_id> <end_message_id> (单次最多 {MAX_IMPORT_RANGE})\n"
-        "/publish_now 立即发布下一条 pending（忽略时间窗与间隔）\n"
-        "/skip <message_id> 跳过当前任务队列消息\n"
-        "/retry_failed 重试 failed 消息\n\n"
-        "/retry_waiting 重试 waiting 消息\n\n"
-        "【设置】(admin/super)\n"
-        "/set_interval <seconds> (必须 > 0)\n"
-        "/set_daily_limit <count> (count>=0)\n"
-        "/set_time_window <HH:MM> <HH:MM>\n"
-        "/set_mode copy|forward\n"
-        "/set_delete_after_success on|off\n"
-        "/set_auto_capture on|off\n"
-        "/set_tick <seconds> (仅 super, 1-3600)\n"
-        "/debug_media on|off (仅 super, 媒体更新诊断)\n"
-        "/debug_queue <message_id> (admin/super)\n"
-        "/restart (仅 super，触发重启流程)\n\n"
-        "【过滤】(admin/super)\n"
-        "/filters 查看过滤\n"
-        "/set_filter <bool_key> on|off\n"
-        "/set_filter min_text_length <number>\n"
-        "/set_filter max_text_length <number>\n\n"
+        "📘 sosoFlow 完整命令帮助\n"
+        "说明：`[A]`=admin/super，`[S]`=仅super\n\n"
+        "【通用】\n"
+        "/start [A] 打开主菜单\n"
+        "/help [A] 查看完整帮助\n"
+        "/status [A] 查看系统总览统计\n\n"
+        "【任务管理】\n"
+        "/add_task <name> <source_chat_id> <target_chat_id> [A] 新建任务\n"
+        "/tasks [A] 查看任务列表\n"
+        "/use_task <task_id> [A] 选择当前任务\n"
+        "/task_status [A] 查看当前任务详情\n"
+        "/start_task [A] 启动当前任务\n"
+        "/pause_task [A] 暂停当前任务\n"
+        "/delete_task <task_id> [A] 删除任务（二次确认）\n\n"
+        "【发布与队列】\n"
+        f"/import_range <start_id> <end_id> [A] 设定发布范围（单次最多 {MAX_IMPORT_RANGE}）\n"
+        "/publish_now [A] 立即发布下一条（忽略时段/间隔）\n"
+        "/skip <message_id> [A] 手动跳过一条消息\n"
+        "/retry_failed [A] 重置 failed/waiting 为 pending\n"
+        "/retry_waiting [A] 仅重置 waiting 为 pending\n\n"
+        "【任务配置】\n"
+        "/set_interval <seconds> [A] 设置发布间隔（>=1）\n"
+        "/set_daily_limit <count> [A] 设置日上限（>=0）\n"
+        "/set_time_window <HH:MM> <HH:MM> [A] 设置发布时间窗\n"
+        "/set_mode copy|forward [A] 设置发布模式\n"
+        "/set_delete_after_success on|off [A] 设置发布后删源\n"
+        "/set_auto_capture on|off [A] 设置自动监听入队\n\n"
+        "【过滤】\n"
+        "/filters [A] 查看当前过滤规则\n"
+        "/set_filter <key> on|off [A] 设置布尔过滤项\n"
+        "/set_filter min_text_length <number> [A] 设置最短字数\n"
+        "/set_filter max_text_length <number> [A] 设置最长字数\n"
+        "可用布尔 key：require_photo, require_video, require_text, exclude_links, exclude_no_text, exclude_forwarded, exclude_sticker, exclude_poll\n\n"
+        "【监听源】\n"
+        "/sources [A] 查看监听源列表（状态+latest）\n"
+        "/set_source <source_chat_id> on|off [A] 启停指定源监听\n\n"
+        "【诊断与运维】\n"
+        "/debug_queue <message_id> [A] 查看当前任务该消息元数据\n"
+        "/set_tick <seconds> [S] 设置全局调度 tick（1-3600）\n"
+        "/debug_media on|off [S] 开关媒体更新诊断日志\n"
+        "/restart [S] 触发重启流程（guide/exit/exec）\n\n"
         "【管理员】\n"
-        "/admins 查看管理员(admin/super)\n"
-        "/add_admin <telegram_user_id> (仅 super)\n"
-        "/remove_admin <telegram_user_id> (仅 super)\n\n"
-        "【便捷功能】\n"
-        "按钮“新建任务”：分步输入 source_chat_id -> target_chat_id\n"
-        "转发任意频道/群消息给机器人：自动回显频道/群ID\n\n"
-        "非管理员统一返回：无权限，请联系 @sosoFlow"
+        "/admins [A] 查看管理员列表\n"
+        "/add_admin <telegram_user_id> [S] 添加普通管理员\n"
+        "/remove_admin <telegram_user_id> [S] 移除普通管理员\n\n"
+        "【交互建议】\n"
+        "优先用按钮操作；需要输入参数时按提示直接发送文本。\n"
+        "所有二次确认均提供取消返回路径。"
     )
     await update.message.reply_text(text)
 
@@ -1220,29 +1722,115 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_start = datetime.combine(now().date(), time.min)
     with SessionLocal() as session:
-        task_count = session.scalar(select(func.count()).select_from(Task)) or 0
-        enabled_count = session.scalar(select(func.count()).select_from(Task).where(Task.enabled.is_(True))) or 0
-        queue_pending = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.status == QueueStatusEnum.pending)) or 0
-        pending_group_units = session.scalar(
-            select(func.count(func.distinct(QueueItem.media_group_id))).where(
-                QueueItem.status == QueueStatusEnum.pending,
-                QueueItem.media_group_id.is_not(None),
-            )
-        ) or 0
-        queue_waiting = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.status == QueueStatusEnum.waiting)) or 0
-        today_published = session.scalar(
-            select(func.count()).select_from(QueueItem).where(
-                QueueItem.status == QueueStatusEnum.published,
-                QueueItem.published_at >= today_start,
-            )
-        ) or 0
-        today_failed = session.scalar(
-            select(func.count()).select_from(QueueItem).where(
-                QueueItem.status == QueueStatusEnum.failed,
-                QueueItem.updated_at >= today_start,
-            )
-        ) or 0
-        failed_total = session.scalar(select(func.count()).select_from(QueueItem).where(QueueItem.status == QueueStatusEnum.failed)) or 0
+        tasks = session.scalars(select(Task)).all()
+        task_count = len(tasks)
+        enabled_count = len([t for t in tasks if t.enabled])
+        queue_pending = 0
+        pending_group_units = 0
+        queue_waiting = 0
+        today_published = 0
+        today_failed = 0
+        failed_total = 0
+        for t in tasks:
+            if has_task_range(t):
+                queue_pending += session.scalar(
+                    select(func.count()).select_from(TaskMessageState).where(
+                        TaskMessageState.task_id == t.id,
+                        TaskMessageState.source_chat_id == t.source_chat_id,
+                        TaskMessageState.message_id >= t.range_start_message_id,
+                        TaskMessageState.message_id <= t.range_end_message_id,
+                        TaskMessageState.status == TaskMessageStatusEnum.pending,
+                    )
+                ) or 0
+                queue_waiting += session.scalar(
+                    select(func.count()).select_from(TaskMessageState).where(
+                        TaskMessageState.task_id == t.id,
+                        TaskMessageState.source_chat_id == t.source_chat_id,
+                        TaskMessageState.message_id >= t.range_start_message_id,
+                        TaskMessageState.message_id <= t.range_end_message_id,
+                        TaskMessageState.status == TaskMessageStatusEnum.waiting,
+                    )
+                ) or 0
+                today_published += session.scalar(
+                    select(func.count()).select_from(TaskMessageState).where(
+                        TaskMessageState.task_id == t.id,
+                        TaskMessageState.source_chat_id == t.source_chat_id,
+                        TaskMessageState.message_id >= t.range_start_message_id,
+                        TaskMessageState.message_id <= t.range_end_message_id,
+                        TaskMessageState.status == TaskMessageStatusEnum.published,
+                        TaskMessageState.published_at.is_not(None),
+                        TaskMessageState.published_at >= today_start,
+                    )
+                ) or 0
+                today_failed += session.scalar(
+                    select(func.count()).select_from(TaskMessageState).where(
+                        TaskMessageState.task_id == t.id,
+                        TaskMessageState.source_chat_id == t.source_chat_id,
+                        TaskMessageState.message_id >= t.range_start_message_id,
+                        TaskMessageState.message_id <= t.range_end_message_id,
+                        TaskMessageState.status == TaskMessageStatusEnum.failed,
+                        TaskMessageState.updated_at >= today_start,
+                    )
+                ) or 0
+                failed_total += session.scalar(
+                    select(func.count()).select_from(TaskMessageState).where(
+                        TaskMessageState.task_id == t.id,
+                        TaskMessageState.source_chat_id == t.source_chat_id,
+                        TaskMessageState.message_id >= t.range_start_message_id,
+                        TaskMessageState.message_id <= t.range_end_message_id,
+                        TaskMessageState.status == TaskMessageStatusEnum.failed,
+                    )
+                ) or 0
+                pending_group_units += session.scalar(
+                    select(func.count(func.distinct(SourceMessage.media_group_id))).where(
+                        SourceMessage.source_chat_id == t.source_chat_id,
+                        SourceMessage.message_id >= t.range_start_message_id,
+                        SourceMessage.message_id <= t.range_end_message_id,
+                        SourceMessage.state == SourceMessageStateEnum.observed,
+                        SourceMessage.media_group_id.is_not(None),
+                        SourceMessage.message_id.in_(
+                            select(TaskMessageState.message_id).where(
+                                TaskMessageState.task_id == t.id,
+                                TaskMessageState.source_chat_id == t.source_chat_id,
+                                TaskMessageState.status == TaskMessageStatusEnum.pending,
+                            )
+                        ),
+                    )
+                ) or 0
+                continue
+            queue_pending += session.scalar(
+                select(func.count()).select_from(QueueItem).where(QueueItem.task_id == t.id, QueueItem.status == QueueStatusEnum.pending)
+            ) or 0
+            pending_group_units += session.scalar(
+                select(func.count(func.distinct(QueueItem.media_group_id))).where(
+                    QueueItem.task_id == t.id,
+                    QueueItem.status == QueueStatusEnum.pending,
+                    QueueItem.media_group_id.is_not(None),
+                )
+            ) or 0
+            queue_waiting += session.scalar(
+                select(func.count()).select_from(QueueItem).where(QueueItem.task_id == t.id, QueueItem.status == QueueStatusEnum.waiting)
+            ) or 0
+            today_published += session.scalar(
+                select(func.count()).select_from(QueueItem).where(
+                    QueueItem.task_id == t.id,
+                    QueueItem.status == QueueStatusEnum.published,
+                    QueueItem.published_at >= today_start,
+                )
+            ) or 0
+            today_failed += session.scalar(
+                select(func.count()).select_from(QueueItem).where(
+                    QueueItem.task_id == t.id,
+                    QueueItem.status == QueueStatusEnum.failed,
+                    QueueItem.updated_at >= today_start,
+                )
+            ) or 0
+            failed_total += session.scalar(
+                select(func.count()).select_from(QueueItem).where(
+                    QueueItem.task_id == t.id,
+                    QueueItem.status == QueueStatusEnum.failed,
+                )
+            ) or 0
         tick = session.get(GlobalSetting, 1).tick_seconds
     await update.message.reply_text(
         f"📊 系统状态\n"
@@ -1342,7 +1930,12 @@ async def delete_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session.get(Task, task_id):
             await update.message.reply_text(f"任务不存在: {task_id}")
             return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("确认删除", callback_data=f"task_delete_yes:{task_id}")]])
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("确认删除", callback_data=f"task_delete_yes:{task_id}")],
+            [InlineKeyboardButton("取消并返回任务列表", callback_data="tasks_list")],
+        ]
+    )
     await update.message.reply_text(f"⚠️ 确认删除任务 {task_id}？", reply_markup=kb)
 
 
@@ -1367,30 +1960,39 @@ async def import_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if end_id - start_id + 1 > MAX_IMPORT_RANGE:
         await update.message.reply_text(f"单次导入最多 {MAX_IMPORT_RANGE} 条，请缩小范围后重试")
         return
-    inserted = 0
-    duplicated = 0
     with SessionLocal() as session:
         db_task = session.get(Task, task.id)
         if not db_task:
             await update.message.reply_text("任务不存在")
             return
+        registry = session.scalar(select(SourceRegistry).where(SourceRegistry.source_chat_id == db_task.source_chat_id))
+        latest_seen = registry.latest_seen_message_id if registry and registry.latest_seen_message_id is not None else None
+        if latest_seen is not None and end_id > latest_seen:
+            end_id = latest_seen
+        if start_id > end_id:
+            await update.message.reply_text("范围无可导入消息（当前源最新消息ID更小）")
+            return
+        src_rows = session.scalars(
+            select(SourceMessage).where(
+                SourceMessage.source_chat_id == db_task.source_chat_id,
+                SourceMessage.state == SourceMessageStateEnum.observed,
+                SourceMessage.message_id >= start_id,
+                SourceMessage.message_id <= end_id,
+            ).order_by(SourceMessage.message_id.asc())
+        ).all()
         db_task.range_start_message_id = start_id
         db_task.range_end_message_id = end_id
         db_task.is_completed = False
         db_task.completed_at = None
-        for msg_id in range(start_id, end_id + 1):
-            exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == msg_id))
-            if exists:
-                duplicated += 1
-                continue
-            session.add(QueueItem(task_id=task.id, message_id=msg_id, message_type="unknown"))
-            inserted += 1
+        write_config_log(session, db_task.id, f"设置发布范围 {start_id}-{end_id}")
         session.commit()
+    observed_count = len(src_rows)
+    missing_known = (end_id - start_id + 1) - observed_count
     await update.message.reply_text(
         f"✅ 导入完成\n"
         f"范围已设定: {start_id}-{end_id}\n"
-        f"入队新增: {inserted}（仅按ID范围入队，未校验消息是否实际存在）\n"
-        f"重复跳过: {duplicated}"
+        f"监听池已观测: {observed_count}\n"
+        f"未观测跳过: {missing_known}"
     )
 
 
@@ -1419,11 +2021,35 @@ async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"参数错误：{exc}\n用法: /skip <message_id>")
         return
     with SessionLocal() as session:
+        db_task = session.get(Task, task.id)
         item = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == message_id))
         if not item:
             await update.message.reply_text("消息不在当前任务队列")
             return
         item.status = QueueStatusEnum.skipped
+        item.fail_reason = None
+        item.next_retry_at = None
+        if has_task_range(db_task):
+            tms = session.scalar(
+                select(TaskMessageState).where(
+                    TaskMessageState.task_id == db_task.id,
+                    TaskMessageState.source_chat_id == db_task.source_chat_id,
+                    TaskMessageState.message_id == message_id,
+                )
+            )
+            if tms:
+                tms.status = TaskMessageStatusEnum.skipped
+                tms.fail_reason = None
+                tms.next_retry_at = None
+            else:
+                session.add(
+                    TaskMessageState(
+                        task_id=db_task.id,
+                        source_chat_id=db_task.source_chat_id,
+                        message_id=message_id,
+                        status=TaskMessageStatusEnum.skipped,
+                    )
+                )
         write_log(session, task.id, item.message_id, None, "skip", "手动跳过")
         session.commit()
     await update.message.reply_text("✅ 已跳过")
@@ -1436,6 +2062,37 @@ async def retry_failed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请先 /use_task <task_id>")
         return
     with SessionLocal() as session:
+        db_task = session.get(Task, task.id)
+        if has_task_range(db_task):
+            tms_rows = session.scalars(
+                select(TaskMessageState).where(
+                    TaskMessageState.task_id == db_task.id,
+                    TaskMessageState.source_chat_id == db_task.source_chat_id,
+                    TaskMessageState.message_id >= db_task.range_start_message_id,
+                    TaskMessageState.message_id <= db_task.range_end_message_id,
+                    TaskMessageState.status.in_([TaskMessageStatusEnum.failed, TaskMessageStatusEnum.waiting]),
+                )
+            ).all()
+            for row in tms_rows:
+                row.status = TaskMessageStatusEnum.pending
+                row.fail_reason = None
+                row.next_retry_at = None
+            base_rows = session.scalars(
+                select(QueueItem).where(
+                    QueueItem.task_id == db_task.id,
+                    QueueItem.message_id >= db_task.range_start_message_id,
+                    QueueItem.message_id <= db_task.range_end_message_id,
+                    QueueItem.status.in_([QueueStatusEnum.failed, QueueStatusEnum.waiting]),
+                )
+            ).all()
+            rows = expand_rows_by_media_group(session, base_rows)
+            for row in rows:
+                row.status = QueueStatusEnum.pending
+                row.fail_reason = None
+                row.next_retry_at = None
+            session.commit()
+            await update.message.reply_text(f"✅ 已重置 failed/waiting -> pending: {len(tms_rows)}")
+            return
         base_rows = session.scalars(
             select(QueueItem).where(
                 QueueItem.task_id == task.id,
@@ -1458,6 +2115,37 @@ async def retry_waiting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("请先 /use_task <task_id>")
         return
     with SessionLocal() as session:
+        db_task = session.get(Task, task.id)
+        if has_task_range(db_task):
+            tms_rows = session.scalars(
+                select(TaskMessageState).where(
+                    TaskMessageState.task_id == db_task.id,
+                    TaskMessageState.source_chat_id == db_task.source_chat_id,
+                    TaskMessageState.message_id >= db_task.range_start_message_id,
+                    TaskMessageState.message_id <= db_task.range_end_message_id,
+                    TaskMessageState.status == TaskMessageStatusEnum.waiting,
+                )
+            ).all()
+            for row in tms_rows:
+                row.status = TaskMessageStatusEnum.pending
+                row.fail_reason = None
+                row.next_retry_at = None
+            base_rows = session.scalars(
+                select(QueueItem).where(
+                    QueueItem.task_id == db_task.id,
+                    QueueItem.message_id >= db_task.range_start_message_id,
+                    QueueItem.message_id <= db_task.range_end_message_id,
+                    QueueItem.status == QueueStatusEnum.waiting,
+                )
+            ).all()
+            rows = expand_rows_by_media_group(session, base_rows)
+            for row in rows:
+                row.status = QueueStatusEnum.pending
+                row.fail_reason = None
+                row.next_retry_at = None
+            session.commit()
+            await update.message.reply_text(f"✅ 已重置 waiting -> pending: {len(tms_rows)}")
+            return
         base_rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.waiting)).all()
         rows = expand_rows_by_media_group(session, base_rows)
         for row in rows:
@@ -1496,6 +2184,9 @@ async def set_interval_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = await set_current_task_simple(update, context, "interval_seconds", seconds)
     if task_id:
         with SessionLocal() as session:
+            write_config_log(session, task_id, f"设置间隔 interval_seconds={seconds}")
+            session.commit()
+        with SessionLocal() as session:
             setting = session.get(GlobalSetting, 1)
             tick_seconds = setting.tick_seconds if setting else 60
         if seconds < tick_seconds:
@@ -1521,6 +2212,9 @@ async def set_daily_limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     task_id = await set_current_task_simple(update, context, "daily_limit", count)
     if task_id:
+        with SessionLocal() as session:
+            write_config_log(session, task_id, f"设置日上限 daily_limit={count}")
+            session.commit()
         await update.message.reply_text(f"✅ daily_limit={count}")
 
 
@@ -1544,6 +2238,7 @@ async def set_time_window_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         db_task = session.get(Task, task.id)
         db_task.active_start_time = start
         db_task.active_end_time = end
+        write_config_log(session, db_task.id, f"设置时段 {start}-{end}")
         session.commit()
     await update.message.reply_text(f"✅ time_window={start}-{end}")
 
@@ -1559,6 +2254,9 @@ async def set_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     task_id = await set_current_task_simple(update, context, "mode", TaskModeEnum(mode))
     if task_id:
+        with SessionLocal() as session:
+            write_config_log(session, task_id, f"设置模式 mode={mode}")
+            session.commit()
         await update.message.reply_text(f"✅ mode={mode}")
 
 
@@ -1574,6 +2272,9 @@ async def set_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, fie
         return
     task_id = await set_current_task_simple(update, context, field, value)
     if task_id:
+        with SessionLocal() as session:
+            write_config_log(session, task_id, f"设置{name}={'on' if value else 'off'}")
+            session.commit()
         await update.message.reply_text(f"✅ {name}={'on' if value else 'off'}")
 
 
@@ -1662,6 +2363,42 @@ async def debug_queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+@require_admin
+async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with SessionLocal() as session:
+        rows = session.scalars(select(SourceRegistry).order_by(SourceRegistry.updated_at.desc(), SourceRegistry.id.desc())).all()
+    if not rows:
+        await update.message.reply_text("📡 监听源列表为空")
+        return
+    lines = ["📡 监听源列表"]
+    for row in rows[:50]:
+        latest = row.latest_seen_message_id if row.latest_seen_message_id is not None else "-"
+        lines.append(f"{'🟢' if row.enabled else '⏸'} {row.source_chat_id} latest={latest}")
+    await update.message.reply_text("\n".join(lines))
+
+
+@require_admin
+async def set_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text("用法: /set_source <source_chat_id> on|off")
+        return
+    try:
+        source_chat_id = parse_int(context.args[0], "source_chat_id")
+        enabled = parse_on_off(context.args[1], "set_source")
+    except ValueError as exc:
+        await update.message.reply_text(f"参数错误：{exc}\n用法: /set_source <source_chat_id> on|off")
+        return
+    with SessionLocal() as session:
+        row = session.scalar(select(SourceRegistry).where(SourceRegistry.source_chat_id == source_chat_id))
+        if not row:
+            row = SourceRegistry(source_chat_id=source_chat_id, enabled=enabled)
+            session.add(row)
+        else:
+            row.enabled = enabled
+        session.commit()
+    await update.message.reply_text(f"✅ source {source_chat_id} 已设为 {'on' if enabled else 'off'}")
+
+
 @require_super
 async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     strategy = env.restart_strategy
@@ -1701,6 +2438,7 @@ async def start_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if db_task:
                 db_task.is_completed = False
                 db_task.completed_at = None
+                write_config_log(session, task_id, "手动启动任务")
                 session.commit()
         await update.message.reply_text("✅ 任务已启动")
 
@@ -1709,6 +2447,9 @@ async def start_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pause_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = await set_current_task_simple(update, context, "enabled", False)
     if task_id:
+        with SessionLocal() as session:
+            write_config_log(session, task_id, "手动暂停任务")
+            session.commit()
         await update.message.reply_text("✅ 任务已暂停")
 
 
@@ -1865,7 +2606,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "tasks_clear_all_ask":
         await query.message.reply_text(
             "⚠️ 二次确认清空全部任务（会清除任务、队列、发布日志与任务选择状态）",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认清空全部任务", callback_data="tasks_clear_all_yes")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("确认清空全部任务", callback_data="tasks_clear_all_yes")],
+                    [InlineKeyboardButton("取消并返回任务列表", callback_data="tasks_list")],
+                ]
+            ),
         )
         return
     if data == "tasks_clear_all_yes":
@@ -1935,6 +2681,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task.enabled = True
             task.is_completed = False
             task.completed_at = None
+            write_config_log(session, task.id, "按钮启动任务")
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
             target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
@@ -1947,6 +2694,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif action == "task_pause":
             task.enabled = False
+            write_config_log(session, task.id, "按钮暂停任务")
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
             target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
@@ -1966,6 +2714,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.reply_text("⚠️ 机器人不在目标频道/群组，请先添加机器人后重试。", reply_markup=kb)
             return
         elif action == "task_retry":
+            if has_task_range(task):
+                tms_rows = session.scalars(
+                    select(TaskMessageState).where(
+                        TaskMessageState.task_id == task.id,
+                        TaskMessageState.source_chat_id == task.source_chat_id,
+                        TaskMessageState.message_id >= task.range_start_message_id,
+                        TaskMessageState.message_id <= task.range_end_message_id,
+                        TaskMessageState.status.in_([TaskMessageStatusEnum.failed, TaskMessageStatusEnum.waiting]),
+                    )
+                ).all()
+                for row in tms_rows:
+                    row.status = TaskMessageStatusEnum.pending
+                    row.fail_reason = None
+                    row.next_retry_at = None
+                base_rows = session.scalars(
+                    select(QueueItem).where(
+                        QueueItem.task_id == task.id,
+                        QueueItem.message_id >= task.range_start_message_id,
+                        QueueItem.message_id <= task.range_end_message_id,
+                        QueueItem.status.in_([QueueStatusEnum.failed, QueueStatusEnum.waiting]),
+                    )
+                ).all()
+                rows = expand_rows_by_media_group(session, base_rows)
+                for row in rows:
+                    row.status = QueueStatusEnum.pending
+                    row.fail_reason = None
+                    row.next_retry_at = None
+                session.commit()
+                await query.message.reply_text(f"✅ 已将 failed/waiting 重置为待发布（{len(tms_rows)}）")
+                return
             base_rows = session.scalars(
                 select(QueueItem).where(
                     QueueItem.task_id == task.id,
@@ -2000,20 +2778,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=task_settings_keyboard(task),
             )
             return
+        elif action == "task_recent_logs":
+            rows = session.scalars(
+                select(PublishLog).where(PublishLog.task_id == task.id).order_by(PublishLog.created_at.desc()).limit(5)
+            ).all()
+            if not rows:
+                await query.message.reply_text("🧾 最近发布日志（5条）\n暂无记录")
+                return
+            lines = []
+            for row in rows:
+                ts = row.created_at.strftime("%m-%d %H:%M:%S") if row.created_at else "-"
+                src = row.source_message_id if row.source_message_id is not None else "-"
+                tgt = row.target_message_id if row.target_message_id is not None else "-"
+                msg = (row.message or "").replace("\n", " ")
+                if len(msg) > 80:
+                    msg = msg[:80] + "..."
+                lines.append(f"[{ts}] {row.action} src={src} tgt={tgt} {msg}")
+            await query.message.reply_text("🧾 最近发布日志（5条）\n" + "\n".join(lines))
+            return
         elif action == "task_toggle_mode":
             task.mode = TaskModeEnum.forward if task.mode == TaskModeEnum.copy else TaskModeEnum.copy
+            write_config_log(session, task.id, f"按钮切换模式 mode={task.mode.value}")
             session.commit()
             await edit_query_message_text_or_caption(query, build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
             await query.message.reply_text(f"✅ 模式已切换为 {mode_label(task.mode)}")
             return
         elif action == "task_toggle_auto_capture":
             task.auto_capture_enabled = not task.auto_capture_enabled
+            write_config_log(session, task.id, f"按钮设置自动监听 auto_capture={'on' if task.auto_capture_enabled else 'off'}")
             session.commit()
             await edit_query_message_text_or_caption(query, build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
             await query.message.reply_text(f"✅ 自动监听已设为 {bool_cn(task.auto_capture_enabled)}")
             return
         elif action == "task_toggle_delete":
             task.delete_after_success = not task.delete_after_success
+            write_config_log(session, task.id, f"按钮设置发布后删源 delete_after_success={'on' if task.delete_after_success else 'off'}")
             session.commit()
             await edit_query_message_text_or_caption(query, build_task_settings_text(task), reply_markup=task_settings_keyboard(task))
             await query.message.reply_text(f"✅ 发布后删源已设为 {bool_cn(task.delete_after_success)}")
@@ -2111,12 +2910,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("✅ 最长字数限制已关闭")
             return
         elif action == "task_delete_ask":
-            await query.message.reply_text(f"⚠️ 二次确认删除任务 {task.id}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认删除", callback_data=f"task_delete_yes:{task.id}")]]))
+            await query.message.reply_text(
+                f"⚠️ 二次确认删除任务 {task.id}",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("确认删除", callback_data=f"task_delete_yes:{task.id}")],
+                        [InlineKeyboardButton("取消并返回任务详情", callback_data=f"task_view:{task.id}")],
+                    ]
+                ),
+            )
             return
         elif action == "task_reset_ask":
             await query.message.reply_text(
                 f"⚠️ 二次确认重置任务 {task.id}（清空队列与日志，重置设置并暂停）",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("确认重置任务", callback_data=f"task_reset_yes:{task.id}")]]),
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("确认重置任务", callback_data=f"task_reset_yes:{task.id}")],
+                        [InlineKeyboardButton("取消并返回任务详情", callback_data=f"task_view:{task.id}")],
+                    ]
+                ),
             )
             return
         elif action == "task_reset_yes":
@@ -2298,8 +3110,6 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
         if end_id - start_id + 1 > MAX_IMPORT_RANGE:
             await msg.reply_text(f"单次导入最多 {MAX_IMPORT_RANGE} 条，请缩小范围")
             return True
-        inserted = 0
-        duplicated = 0
         with SessionLocal() as session:
             task = session.get(Task, task_id)
             if not task:
@@ -2307,23 +3117,34 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("pending_input_action", None)
                 context.user_data.pop("pending_task_id", None)
                 return True
+            registry = session.scalar(select(SourceRegistry).where(SourceRegistry.source_chat_id == task.source_chat_id))
+            latest_seen = registry.latest_seen_message_id if registry and registry.latest_seen_message_id is not None else None
+            if latest_seen is not None and end_id > latest_seen:
+                end_id = latest_seen
+            if start_id > end_id:
+                await msg.reply_text("范围无可导入消息（当前源最新消息ID更小）")
+                return True
+            src_rows = session.scalars(
+                select(SourceMessage).where(
+                    SourceMessage.source_chat_id == task.source_chat_id,
+                    SourceMessage.state == SourceMessageStateEnum.observed,
+                    SourceMessage.message_id >= start_id,
+                    SourceMessage.message_id <= end_id,
+                ).order_by(SourceMessage.message_id.asc())
+            ).all()
             task.range_start_message_id = start_id
             task.range_end_message_id = end_id
             task.is_completed = False
             task.completed_at = None
-            for mid in range(start_id, end_id + 1):
-                exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.message_id == mid))
-                if exists:
-                    duplicated += 1
-                    continue
-                session.add(QueueItem(task_id=task.id, message_id=mid, message_type="unknown"))
-                inserted += 1
+            write_config_log(session, task.id, f"输入设置发布范围 {start_id}-{end_id}")
             session.commit()
+        observed_count = len(src_rows)
+        missing_known = (end_id - start_id + 1) - observed_count
         await msg.reply_text(
             f"✅ 导入完成\n"
             f"范围已设定: {start_id}-{end_id}\n"
-            f"入队新增: {inserted}（仅按ID范围入队，未校验消息是否实际存在）\n"
-            f"重复跳过: {duplicated}"
+            f"监听池已观测: {observed_count}\n"
+            f"未观测跳过: {missing_known}"
         )
         context.user_data.pop("pending_input_action", None)
         context.user_data.pop("pending_task_id", None)
@@ -2350,6 +3171,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("pending_task_id", None)
                 return True
             task.interval_seconds = seconds
+            write_config_log(session, task.id, f"输入设置间隔 interval_seconds={seconds}")
             session.commit()
             session.refresh(task)
             setting = session.get(GlobalSetting, 1)
@@ -2384,6 +3206,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("pending_task_id", None)
                 return True
             task.daily_limit = daily_limit
+            write_config_log(session, task.id, f"输入设置日上限 daily_limit={daily_limit}")
             session.commit()
             session.refresh(task)
             await msg.reply_text(
@@ -2434,6 +3257,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 return True
             task.active_start_time = start_time
             task.active_end_time = end_time
+            write_config_log(session, task.id, f"输入设置时段 {start_time}-{end_time}")
             session.commit()
             session.refresh(task)
             await msg.reply_text(
@@ -2463,6 +3287,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("pending_task_id", None)
                 return True
             task.source_chat_id = source_chat_id
+            write_config_log(session, task.id, f"输入设置来源ID source_chat_id={source_chat_id}")
             session.commit()
             session.refresh(task)
             await msg.reply_text(
@@ -2491,6 +3316,7 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("pending_task_id", None)
                 return True
             task.target_chat_id = target_chat_id
+            write_config_log(session, task.id, f"输入设置目标ID target_chat_id={target_chat_id}")
             session.commit()
             session.refresh(task)
             await msg.reply_text(
@@ -2677,7 +3503,26 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif msg.poll:
         message_type = "poll"
     with SessionLocal() as session:
+        if msg.chat.type != "private" and not is_source_enabled(session, source_chat_id):
+            return
+        upsert_source_registry_and_message(
+            session=session,
+            source_chat_id=source_chat_id,
+            message_id=msg.message_id,
+            message_type=message_type,
+            file_id=file_id,
+            caption=msg.caption,
+            text_value=text_value,
+            has_photo=bool(msg.photo),
+            has_video=bool(msg.video),
+            has_document=bool(msg.document),
+            is_forwarded=bool(msg.forward_origin),
+            media_group_id=msg.media_group_id,
+        )
         tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id, Task.auto_capture_enabled.is_(True))).all()
+        if not tasks and msg.chat.type != "private":
+            ensure_auto_source_capture_task(session, source_chat_id)
+            tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id, Task.auto_capture_enabled.is_(True))).all()
         for task in tasks:
             upsert_queue_item_from_capture(
                 session=session,
@@ -2738,6 +3583,8 @@ async def post_init_hook(application: Application):
             BotCommand("retry_waiting", "重试等待消息"),
             BotCommand("debug_media", "媒体更新诊断（仅super）"),
             BotCommand("debug_queue", "查看队列元数据"),
+            BotCommand("sources", "查看监听源列表"),
+            BotCommand("set_source", "启停监听源"),
             BotCommand("restart", "重启流程（仅super）"),
         ]
     )
@@ -2905,6 +3752,8 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("set_tick", set_tick_cmd))
     app.add_handler(CommandHandler("debug_media", debug_media_cmd))
     app.add_handler(CommandHandler("debug_queue", debug_queue_cmd))
+    app.add_handler(CommandHandler("sources", sources_cmd))
+    app.add_handler(CommandHandler("set_source", set_source_cmd))
     app.add_handler(CommandHandler("restart", restart_cmd))
     app.add_handler(CommandHandler("start_task", start_task_cmd))
     app.add_handler(CommandHandler("pause_task", pause_task_cmd))

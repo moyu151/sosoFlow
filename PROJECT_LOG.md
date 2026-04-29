@@ -121,6 +121,22 @@
 - 本次“媒体组占位补全”修复后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（36 passed）
 - 本次“channel_post 捕获链路修复”后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（37 passed）
 - 本次“范围自动完成”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（39 passed）
+- 本次“自动建源采集任务”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（40 passed）
+- 本次“监听列表基础表”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（41 passed）
+- 本次“范围导入切到监听池”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（41 passed）
+- 本次“范围发布读取监听池（同步式切流）”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（41 passed）
+- 本次“task_message_state 接入”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（42 passed）
+- 本次“范围判定切到 task_message_state”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（42 passed）
+- 本次“重试与详情统计切到 task_message_state”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（42 passed）
+- 本次“日志预览按钮 + 范围任务今日发布口径切换”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（42 passed）
+- 本次“/status 口径统一”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（42 passed）
+- 本次“发布单元统计口径统一”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（42 passed）
+- 本次“发布入口去卡死修复”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
+- 本次“多任务删源门槛”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
+- 本次“源监听管理命令”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
+- 本次“口径与状态一致性修复”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
+- 本次“配置变更审计日志”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
+- 本次“交互统一与帮助文案升级”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
 
 ### 增量更新（本次）
 
@@ -157,6 +173,110 @@
 - 新增回归测试：
   - `tests/test_range_completion.py::test_pick_next_publish_item_respects_task_range`
   - `tests/test_range_completion.py::test_publish_one_auto_completes_task_when_range_done`
+- 新增“机器人进群自动监听（自动建源采集任务）”能力：
+  - 当 `capture_new_message` 收到非私聊来源消息且当前无匹配 `source_chat_id` 任务时，自动创建任务：
+    - `name=auto_source_<chat_id>`
+    - `source_chat_id=<当前群/频道>`
+    - `target_chat_id` 先占位为 `source_chat_id`
+    - `enabled=false`（默认暂停，防止误发布）
+    - `auto_capture_enabled=true`
+  - 自动创建后立即按正常链路入队，确保 `media_group_id/file_id` 可以被完整采集
+  - 管理员后续只需编辑目标ID并启动任务即可发布
+- 新增回归测试：
+  - `tests/test_capture_channel_post.py::test_channel_post_auto_creates_source_capture_task_when_missing`
+  - 验证“无任务情况下，channel_post 会自动建任务并保留 media_group_id 入队”
+- 新增“监听列表基础设施（第一阶段，双写不切流）”：
+  - 新增模型与表：
+    - `source_registry`：`source_chat_id/enabled/latest_seen_message_id`
+    - `source_messages`：按 `source_chat_id + message_id` 唯一存储采集元数据（含 `media_group_id/file_id/message_type/...`）
+  - 新增 `SourceMessageStateEnum`（`observed/missing/deleted`），当前采集链路写入 `observed`
+  - `capture_new_message` 现在会先写 `source_registry/source_messages`，再走现有任务队列入队（兼容旧逻辑）
+  - 保持线上行为稳定：当前发布仍读原 `queue`，未切换发布数据源
+- 新增回归测试：
+  - `tests/test_capture_channel_post.py::test_channel_post_writes_source_registry_and_source_messages`
+  - 验证频道消息会写入新监听表并保留 `media_group_id/file_id`
+- 发布数据流第二阶段（最小切流）：
+  - `/import_range`（命令与按钮两条入口）改为只从 `source_messages` 导入 `observed` 消息，不再按 ID 盲插 `unknown` 占位
+  - 若监听表存在 `latest_seen_message_id`，导入上界 `end_id` 会自动裁剪到最新观测ID，避免超最新ID后持续无效尝试
+  - 导入结果反馈新增 `未观测跳过` 统计
+  - 与“范围自动完成”机制联动：范围内无 `pending/waiting` 时会自动完成并停止任务
+- 发布数据流第三阶段（范围任务主路径切到监听池）：
+  - 新增 `sync_task_range_queue_from_source_messages`：发布前按 `task.source_chat_id + range` 从 `source_messages(observed)` 同步到任务队列
+  - 同步策略：不存在则新增 `pending`；已存在且非终态则补全 `media_group_id/file_id/message_type` 等元数据
+  - `/import_range` 进一步收敛为“设定范围 + 观测统计”，不再直接向 `queue` 批量写入快照
+  - 效果：范围任务发布可持续消费监听池的最新观测数据，不依赖一次性导入快照
+- 发布状态模型第四阶段（为一源多目标做状态解耦）：
+  - 新增 `TaskMessageStatusEnum` 与 `task_message_state` 表（`task_id + source_chat_id + message_id` 唯一）
+  - 新增 `upsert_task_message_state_from_queue_item`，将队列状态镜像到任务消息状态
+  - 在 `sync_task_range_queue_from_source_messages` 与 `publish_one`（成功/失败/等待/跳过路径）中同步写入 `task_message_state`
+  - 作用：任务级状态与源消息池建立稳定映射，为后续“脱离 queue 直接发布”提供状态底座
+- 新增回归测试：
+  - `tests/test_range_completion.py::test_publish_sync_creates_task_message_state_from_source_messages`
+  - 验证从 `source_messages` 同步并发布后，`task_message_state` 会落为 `published`
+- 发布状态模型第五阶段（范围任务状态主判定切换）：
+  - `pick_next_publish_item` 在“有范围任务”下优先从 `task_message_state` 选择 `pending/waiting` 消息，再按 `source_messages` 动态补齐 `queue` 载荷
+  - `try_auto_complete_task_range` 改为以 `task_message_state` 的 `pending/waiting` 数量作为完成判定依据
+  - 保留过渡兼容：当 `task_message_state` 尚未覆盖时，自动回退旧 `queue` 选择逻辑
+  - 效果：范围任务的“是否待发布/是否完成”已从 `queue` 迁移到任务独立状态层，降低单队列耦合
+- 发布状态模型第六阶段（运营链路迁移）：
+  - 新增 `task_message_stats`，范围任务详情优先展示 `task_message_state` 统计（pending/waiting/published/failed/skipped）
+  - `/retry_failed`、`/retry_waiting`、任务详情按钮“重试失败”在范围任务下优先操作 `task_message_state`，并同步兼容更新 `queue`
+  - 非范围任务保持旧 `queue` 逻辑不变
+  - 效果：范围任务的重试与监控操作与新状态层一致，减少对旧队列实现细节依赖
+- 任务详情与日志可观测性增强：
+  - 新增任务详情按钮：`🧾 最近日志(5条)`（界面保持不切页，单独消息展示）
+  - 日志内容包含：时间、action、source_message_id、target_message_id、消息摘要（截断）
+  - 范围任务“今日发布”计数口径改为 `task_message_state.published_at`；非范围任务仍沿用 `queue.published_at`
+- 运维统计口径统一（系统级）：
+  - `/status` 在汇总任务时采用分流口径：
+    - 范围任务：优先基于 `task_message_state`（pending/waiting/published/failed）
+    - 非范围任务：沿用 `queue`
+  - 目的：避免范围任务在新状态层下与系统总览口径不一致
+- 任务详情发布单元统计口径统一：
+  - 新增 `task_publish_unit_stats_v2`
+  - 范围任务：`单条待发/媒体组待发` 改为基于 `task_message_state(pending)` + `source_messages.media_group_id`
+  - 非范围任务：继续沿用 `queue` 统计
+  - 目的：任务详情关键计数口径与新状态层保持一致
+- 发布入口稳定性增强（范围任务）：
+  - `pick_next_publish_item` 在范围任务下改为遍历 `task_message_state` 候选，而非仅取首条
+  - 若候选消息在 `source_messages` 无法构建载荷（未观测/已删除），会自动标记该条为 `failed` 并继续寻找下一条
+  - 避免 `/publish_now` 与任务按钮发布出现“有 pending 但实际发布卡住”的情况
+- 新增回归测试：
+  - `tests/test_range_completion.py::test_pick_next_publish_item_marks_unresolvable_tms_failed`
+  - 验证不可解析的 pending 状态会被自动终态化为 failed，不阻塞后续发布
+- 一源多目标删除保护（第一版门槛）：
+  - 新增 `try_delete_source_message_if_ready`：
+    - 同一 `source_chat_id + message_id` 仅当该源下所有 `auto_capture_enabled` 任务的 `task_message_state` 都进入终态（published/failed/skipped）时才允许删除
+    - 若任一任务尚未终态或无状态，删除延后并记录 `delete_defer`
+  - 发布成功后的删源逻辑（单条/媒体组）改为调用上述门槛，而非立即删除
+  - 作用：避免一个任务提前删源，破坏其他目标任务后续分发
+- 新增源监听管理（运营可控）：
+  - 新增命令：
+    - `/sources`：查看监听源列表（开关状态 + latest_seen_message_id）
+    - `/set_source <source_chat_id> on|off`：启用/暂停某个源监听
+  - 采集链路新增开关判断：当 `source_registry.enabled=false` 时，该源新消息不再入监听池与任务队列
+  - `help` 与 `setMyCommands` 已同步更新
+- 一致性修复（冲突/分裂收敛）：
+  - `publish_one` 的日上限判定改为统一使用 `today_published_count`（范围任务走 `task_message_state`，非范围任务走 `queue`）
+  - `/skip` 在范围任务下同步写入 `task_message_state=skipped`（并清理 fail/next_retry），避免“queue 已跳过但状态层仍 pending/waiting”的分裂
+  - 自动删源功能保留，不作为当前流程强依赖；本轮未改变其开关语义
+- 新增配置变更审计（便于频繁手动运维追溯）：
+  - 新增 `config` 类型日志（复用 `publish_logs`）
+  - 覆盖入口：
+    - 命令：启动/暂停、间隔、日上限、时段、模式、开关、导入范围
+    - 按钮：启动/暂停、模式切换、自动监听开关、发布后删源开关
+    - 输入引导：间隔、日上限、时段、来源ID、目标ID、导入范围
+  - 作用：当你频繁手动调参时，可通过“最近日志”直接回溯变更轨迹与影响时点
+- 交互/UI 一致性优化（产品化收敛）：
+  - 任务详情底部导航统一为：`返回任务列表 + 主菜单`
+  - 任务设置底部导航统一为：`任务列表 + 主菜单`
+  - 过滤设置底部导航统一为：`返回任务设置 + 主菜单`
+  - 任务详情危险操作（重置/删除）合并同一层级，降低误触路径分散
+  - 二次确认弹窗统一增加“取消并返回”按钮（清空任务、重置任务、删除任务、命令删除任务）
+- 帮助文案升级（全量命令穷举）：
+  - `/help` 改为“按领域分组 + 权限标识（[A]/[S]）+ 一行说明”
+  - 覆盖所有已注册命令（含 sources/set_source、start_task/pause_task、诊断与运维命令）
+  - 补充过滤 key 列表与交互使用建议
 
 ### 下一步建议（最高优先）
 
