@@ -105,6 +105,7 @@ class Task(Base):
     active_end_time: Mapped[str] = mapped_column(String(5), default="23:59")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_capture_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    recapture_on_edit_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     delete_after_success: Mapped[bool] = mapped_column(Boolean, default=False)
     range_start_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     range_end_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
@@ -805,7 +806,7 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
         f"下次可发布剩余: {next_publish_in_seconds}s\n\n"
         f"日上限: {task.daily_limit}\n"
         f"发布时段: {task.active_start_time}-{task.active_end_time}\n"
-        f"任务监听源消息: {bool_cn(task.auto_capture_enabled)}\n"
+        f"编辑后重新入队: {bool_cn(task.recapture_on_edit_enabled)}\n"
         f"发布后删除源消息: {bool_cn(task.delete_after_success)}\n"
         f"下一条待发布: {next_pending_id if next_pending_id is not None else '无'}\n\n"
         f"过滤: {filter_summary(task_filter)}"
@@ -817,15 +818,15 @@ def task_detail_keyboard(task_id: int):
     with SessionLocal() as session:
         task = session.get(Task, task_id)
     mode_btn = "🧭 切换模式"
-    capture_btn = "📡 监听状态"
     delete_btn = "🧹 是否删源"
+    recapture_btn = "📝 编辑重发"
     interval_btn = "⏱ 间隔"
     daily_btn = "📊 日上限"
     window_btn = "🕒 时段"
     if task:
         mode_btn = "🧭 当前模式（复制）" if task.mode == TaskModeEnum.copy else "🧭 当前模式（转发）"
-        capture_btn = f"📡 监听状态（{'开' if task.auto_capture_enabled else '关'}）"
         delete_btn = f"🧹 是否删源（{'是' if task.delete_after_success else '否'}）"
+        recapture_btn = f"📝 编辑重发（{'开' if task.recapture_on_edit_enabled else '关'}）"
         interval_btn = f"⏱ 间隔（{task.interval_seconds}秒）"
         daily_btn = f"📊 日上限（{task.daily_limit}）"
         window_btn = f"🕒 时段（{task.active_start_time}-{task.active_end_time}）"
@@ -836,7 +837,7 @@ def task_detail_keyboard(task_id: int):
             [InlineKeyboardButton("🚀 立即发布", callback_data=f"task_publish:{task_id}"), InlineKeyboardButton("📥 导入范围", callback_data=f"task_import_hint:{task_id}")],
             [InlineKeyboardButton("—— 配置操作 ——", callback_data="noop")],
             [InlineKeyboardButton(with_name, callback_data=f"task_edit_name:{task_id}"), InlineKeyboardButton("🔁 重试失败", callback_data=f"task_retry:{task_id}")],
-            [InlineKeyboardButton(mode_btn, callback_data=f"task_toggle_mode:{task_id}"), InlineKeyboardButton(capture_btn, callback_data=f"task_toggle_auto_capture:{task_id}")],
+            [InlineKeyboardButton(mode_btn, callback_data=f"task_toggle_mode:{task_id}"), InlineKeyboardButton(recapture_btn, callback_data=f"task_toggle_recapture_on_edit:{task_id}")],
             [InlineKeyboardButton(delete_btn, callback_data=f"task_toggle_delete:{task_id}"), InlineKeyboardButton("🔍 过滤设置", callback_data=f"task_filters:{task_id}")],
             [InlineKeyboardButton(interval_btn, callback_data=f"task_input_interval:{task_id}"), InlineKeyboardButton(daily_btn, callback_data=f"task_input_daily:{task_id}")],
             [InlineKeyboardButton(window_btn, callback_data=f"task_input_window:{task_id}")],
@@ -1075,8 +1076,6 @@ async def try_delete_source_message_if_ready(application: Application, session, 
         return False, "delete_not_required"
     for t in tasks:
         # 仅检查会消费该源的任务，已彻底关闭自动监听的任务不参与删源门槛。
-        if not t.auto_capture_enabled:
-            continue
         tms = session.scalar(
             select(TaskMessageState).where(
                 TaskMessageState.task_id == t.id,
@@ -1370,12 +1369,23 @@ def upsert_queue_item_from_capture(
     has_document: bool,
     is_forwarded: bool,
     media_group_id: Optional[str],
+    is_edit_update: bool = False,
+    recapture_on_edit_enabled: bool = False,
 ):
     exists = session.scalar(select(QueueItem).where(QueueItem.task_id == task_id, QueueItem.message_id == message_id))
     if exists:
-        # published/skipped 视为终态，不再覆盖，避免历史记录被新更新污染。
+        # published/skipped 默认终态；开启编辑重入队后，编辑事件可将其回退为 pending。
         if exists.status in {QueueStatusEnum.published, QueueStatusEnum.skipped}:
-            return
+            if not (is_edit_update and recapture_on_edit_enabled):
+                return
+            exists.status = QueueStatusEnum.pending
+            exists.target_message_id = None
+            exists.published_at = None
+            exists.deleted_at = None
+            exists.fail_reason = None
+            exists.filter_reason = None
+            exists.retry_count = 0
+            exists.next_retry_at = None
         if exists.status in {QueueStatusEnum.waiting, QueueStatusEnum.failed}:
             exists.status = QueueStatusEnum.pending
             exists.fail_reason = None
@@ -1757,7 +1767,7 @@ def build_full_help_text() -> str:
         "/set_mode copy|forward [A] 设置发布模式\n"
         "/rename_task <new_name> [A] 修改当前任务名称\n"
         "/set_delete_after_success on|off [A] 设置发布后删源\n"
-        "/set_auto_capture on|off [A] 设置自动监听入队\n\n"
+        "/set_recapture_on_edit on|off [A] 设置编辑后重新入队\n\n"
         "【过滤】\n"
         "/filters [A] 查看当前过滤规则\n"
         "/set_filter <key> on|off [A] 设置布尔过滤项\n"
@@ -2373,7 +2383,12 @@ async def set_delete_after_success_cmd(update: Update, context: ContextTypes.DEF
 
 @require_admin
 async def set_auto_capture_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await set_toggle_cmd(update, context, "auto_capture_enabled", "set_auto_capture")
+    await update.message.reply_text("ℹ️ 任务级“监听状态”已下线。现在由源监听列表（/sources, /set_source）+ 任务启动/暂停统一控制。")
+
+
+@require_admin
+async def set_recapture_on_edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await set_toggle_cmd(update, context, "recapture_on_edit_enabled", "set_recapture_on_edit")
 
 
 @require_super
@@ -2899,13 +2914,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("✍️ 请输入新的任务名称（最多200字符）")
             return
         elif action == "task_toggle_auto_capture":
-            task.auto_capture_enabled = not task.auto_capture_enabled
-            write_config_log(session, task.id, f"按钮设置自动监听 auto_capture={'on' if task.auto_capture_enabled else 'off'}")
+            await query.message.reply_text("ℹ️ 该开关已下线：请用 /set_source 控制源监听，用任务启动/暂停控制发布。")
+            return
+        elif action == "task_toggle_recapture_on_edit":
+            task.recapture_on_edit_enabled = not task.recapture_on_edit_enabled
+            write_config_log(
+                session,
+                task.id,
+                f"按钮设置编辑后重新入队 recapture_on_edit={'on' if task.recapture_on_edit_enabled else 'off'}",
+            )
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
             target_name = await resolve_chat_display_name(context.application, task.target_chat_id)
-            await edit_query_message_text_or_caption(query, build_task_detail_text(session, task, source_name=source_name, target_name=target_name), reply_markup=task_detail_keyboard(task.id))
-            await query.message.reply_text(f"✅ 任务接收源消息已设为 {bool_cn(task.auto_capture_enabled)}")
+            await edit_query_message_text_or_caption(
+                query,
+                build_task_detail_text(session, task, source_name=source_name, target_name=target_name),
+                reply_markup=task_detail_keyboard(task.id),
+            )
+            await query.message.reply_text(f"✅ 编辑后重新入队已设为 {bool_cn(task.recapture_on_edit_enabled)}")
             return
         elif action == "task_toggle_delete":
             task.delete_after_success = not task.delete_after_success
@@ -3069,6 +3095,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 task.active_end_time = "23:59"
                 task.enabled = False
                 task.auto_capture_enabled = True
+                task.recapture_on_edit_enabled = False
                 task.delete_after_success = False
                 task.last_published_at = None
                 session.commit()
@@ -3652,6 +3679,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text("⚠️ 未识别到目标ID。请直接输入目标频道/群组ID，或转发一条来自目标频道/群组的消息。")
         return
     source_chat_id = msg.chat_id
+    is_edit_update = update_type in {"edited_message", "edited_channel_post"}
     text_value = msg.text or msg.caption or ""
     message_type = "text"
     file_id = None
@@ -3685,10 +3713,10 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             is_forwarded=bool(msg.forward_origin),
             media_group_id=msg.media_group_id,
         )
-        tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id, Task.auto_capture_enabled.is_(True))).all()
+        tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id)).all()
         if not tasks and msg.chat.type != "private":
             ensure_auto_source_capture_task(session, source_chat_id)
-            tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id, Task.auto_capture_enabled.is_(True))).all()
+            tasks = session.scalars(select(Task).where(Task.source_chat_id == source_chat_id)).all()
         for task in tasks:
             upsert_queue_item_from_capture(
                 session=session,
@@ -3703,6 +3731,8 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 has_document=bool(msg.document),
                 is_forwarded=bool(msg.forward_origin),
                 media_group_id=msg.media_group_id,
+                is_edit_update=is_edit_update,
+                recapture_on_edit_enabled=bool(task.recapture_on_edit_enabled),
             )
         session.commit()
 
@@ -3748,6 +3778,7 @@ async def post_init_hook(application: Application):
             BotCommand("retry_failed", "重试失败消息"),
             BotCommand("retry_waiting", "重试等待消息"),
             BotCommand("rename_task", "修改当前任务名称"),
+            BotCommand("set_recapture_on_edit", "编辑后重新入队"),
             BotCommand("debug_media", "媒体更新诊断（仅super）"),
             BotCommand("debug_queue", "查看队列元数据"),
             BotCommand("sources", "查看监听源列表"),
@@ -3797,6 +3828,9 @@ def init_db():
         if "completed_at" not in task_columns:
             completed_at_type = "TIMESTAMP" if database_type(env.database_url) == "postgresql" else "DATETIME"
             conn.execute(sql_text(f"ALTER TABLE tasks ADD COLUMN completed_at {completed_at_type}"))
+        if "recapture_on_edit_enabled" not in task_columns:
+            conn.execute(sql_text("ALTER TABLE tasks ADD COLUMN recapture_on_edit_enabled BOOLEAN DEFAULT FALSE"))
+            conn.execute(sql_text("UPDATE tasks SET recapture_on_edit_enabled = FALSE WHERE recapture_on_edit_enabled IS NULL"))
     columns = {col["name"] for col in inspector.get_columns("queue")}
     with engine.begin() as conn:
         if "file_id" not in columns:
@@ -3924,6 +3958,7 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("rename_task", rename_task_cmd))
     app.add_handler(CommandHandler("set_delete_after_success", set_delete_after_success_cmd))
     app.add_handler(CommandHandler("set_auto_capture", set_auto_capture_cmd))
+    app.add_handler(CommandHandler("set_recapture_on_edit", set_recapture_on_edit_cmd))
     app.add_handler(CommandHandler("set_tick", set_tick_cmd))
     app.add_handler(CommandHandler("debug_media", debug_media_cmd))
     app.add_handler(CommandHandler("debug_queue", debug_queue_cmd))

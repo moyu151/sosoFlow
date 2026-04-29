@@ -130,7 +130,7 @@ DATABASE_URL=postgresql://USER:PASSWORD@HOST/DB?sslmode=require
 - `/set_daily_limit <count>` 设置日上限 `[A]`
 - `/set_time_window <HH:MM> <HH:MM>` 设置发布时段 `[A]`
 - `/set_mode <copy|forward>` 设置发布模式 `[A]`
-- `/set_auto_capture <on|off>` 任务监听源消息开关 `[A]`
+- `/set_auto_capture <on|off>` 已下线（保留兼容提示，不再生效）`[A]`
 - `/set_delete_after_success <on|off>` 发布后删源开关 `[A]`
 - `/set_tick <seconds>` 设置全局调度 tick `[S]`
 

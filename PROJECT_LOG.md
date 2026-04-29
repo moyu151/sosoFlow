@@ -572,3 +572,62 @@
 ### 下一步建议（最高优先）
 
 - 为 README 增加 3-5 张真实界面截图（主菜单、任务列表、任务详情、过滤页、状态页），提升 GitHub 首屏转化与可理解性。
+
+### 增量更新（编辑后重入队开关）
+
+- 新增任务级可控开关：`recapture_on_edit_enabled`（默认关闭）
+  - 入口1：任务详情按钮 `📝 编辑重发（开/关）`
+  - 入口2：命令 `/set_recapture_on_edit on|off`
+- 编辑消息监听与入队逻辑增强：
+  - 已监听 `edited_message/edited_channel_post` 的基础上，若该开关开启：
+    - 当队列项状态为 `published/skipped` 且收到编辑更新时，自动回退为 `pending`
+    - 清理发布结果字段（`target_message_id/published_at/fail_reason/filter_reason/retry_count/next_retry_at`）
+    - 同步刷新最新元数据（文本/媒体类型/file_id/media_group_id）
+  - 若开关关闭，维持原逻辑：`published/skipped` 终态不覆盖
+- 任务详情文案新增：`编辑后重新入队: 开启/关闭`
+- 任务重置行为补齐：重置任务时将该开关恢复默认 `False`
+- 迁移兼容：`init_db` 为旧库自动补列 `tasks.recapture_on_edit_enabled`（默认 false）
+- 帮助与命令菜单同步：
+  - `setMyCommands` 增加 `set_recapture_on_edit`
+  - `/help` 增加该命令说明
+- 本轮改动文件：
+  - `main.py`
+  - `PROJECT_LOG.md`
+
+### 已验证项
+
+- `python -m py_compile main.py` 通过
+- `pytest -q` 通过（45 passed）
+
+### 下一步建议（最高优先）
+
+- 在任务详情增加“编辑重发策略说明”一行短提示（例如：仅对编辑后的该消息重新入队，不会回溯整段范围），降低误解与误操作。
+
+### 增量更新（下线任务级监听开关）
+
+- 按产品模型收敛：关闭任务级“监听状态”实际作用，统一为“源级监听 + 任务启停”
+  - 任务详情移除“任务监听源消息”展示
+  - 任务详情按钮移除“监听状态（开/关）”
+  - 保留并强调：
+    - 源监听开关：`/set_source`
+    - 任务消费控制：启动/暂停
+- 兼容旧入口（不破坏历史按钮与脚本）：
+  - `/set_auto_capture` 保留命令入口，但改为“已下线提示，不再生效”
+  - 历史回调 `task_toggle_auto_capture` 改为提示已下线
+- 采集与任务绑定逻辑统一：
+  - 新/编辑消息捕获后，对同源的所有任务执行入队补全（不再受 `auto_capture_enabled` 过滤）
+  - 删源门槛判断不再忽略 `auto_capture_enabled=false` 任务，避免口径分裂
+- README 同步：`/set_auto_capture` 标记为“已下线（兼容提示）”
+- 本轮改动文件：
+  - `main.py`
+  - `README.md`
+  - `PROJECT_LOG.md`
+
+### 已验证项
+
+- `python -m py_compile main.py` 通过
+- `pytest -q` 通过（45 passed）
+
+### 下一步建议（最高优先）
+
+- 在任务详情“模式/状态”下方增加一行固定提示：`消息采集由源监听池统一负责，任务启动后自动消费`，进一步减少认知歧义。
