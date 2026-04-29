@@ -137,6 +137,7 @@
 - 本次“口径与状态一致性修复”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
 - 本次“配置变更审计日志”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
 - 本次“交互统一与帮助文案升级”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
+- 本次“任务设置并入详情页”改动后再次验证：`python -m py_compile main.py` 通过，`pytest` 通过（43 passed）
 
 ### 增量更新（本次）
 
@@ -277,6 +278,11 @@
   - `/help` 改为“按领域分组 + 权限标识（[A]/[S]）+ 一行说明”
   - 覆盖所有已注册命令（含 sources/set_source、start_task/pause_task、诊断与运维命令）
   - 补充过滤 key 列表与交互使用建议
+- 任务详情交互统一（设置并入详情）：
+  - 任务详情页直接提供设置操作按钮：改名、模式切换、任务接收开关、删源开关、间隔、日上限、时段、来源ID、目标ID、过滤设置
+  - 过滤页返回按钮改为“返回任务详情”，取消对独立设置页的依赖
+  - 旧 `task_settings` 回调保留兼容（历史消息按钮不报错）
+  - 结果：用户在任务详情单页即可完成管理，路径更短、层级更统一
 
 ### 下一步建议（最高优先）
 
