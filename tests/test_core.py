@@ -73,9 +73,23 @@ def test_parse_hhmm_error(bad_value):
 
 def test_apply_filters_skip_reason():
     task_filter = TaskFilter(require_text=True)
-    item = DummyQueueItem(has_text=False, has_photo=False, has_video=False, has_links=False, text_preview="")
+    item = DummyQueueItem(has_text=True, has_photo=False, has_video=False, has_links=False, message_type="text", text_preview="hello")
     reason = apply_filters(item, task_filter)
-    assert reason == "仅保留纯文字"
+    assert reason == "纯文字"
+
+
+def test_apply_filters_include_keywords_miss():
+    task_filter = TaskFilter(include_keywords_enabled=True, include_keywords="抽奖,活动")
+    item = DummyQueueItem(has_text=True, has_photo=False, has_video=False, has_links=False, message_type="text", text_preview="普通通知")
+    reason = apply_filters(item, task_filter)
+    assert reason == "未命中包含关键词"
+
+
+def test_apply_filters_include_keywords_hit():
+    task_filter = TaskFilter(include_keywords_enabled=True, include_keywords="抽奖,活动")
+    item = DummyQueueItem(has_text=True, has_photo=False, has_video=False, has_links=False, message_type="text", text_preview="今晚有抽奖活动")
+    reason = apply_filters(item, task_filter)
+    assert reason is None
 
 
 def test_apply_filters_unknown_metadata_pass():

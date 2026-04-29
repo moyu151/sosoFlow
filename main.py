@@ -128,6 +128,8 @@ class TaskFilter(Base):
     exclude_forwarded: Mapped[bool] = mapped_column(Boolean, default=False)
     exclude_sticker: Mapped[bool] = mapped_column(Boolean, default=False)
     exclude_poll: Mapped[bool] = mapped_column(Boolean, default=False)
+    include_keywords_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    include_keywords: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     min_text_length: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     max_text_length: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     task: Mapped[Task] = relationship(back_populates="filters_rel")
@@ -722,17 +724,25 @@ def task_publish_unit_stats_v2(session, task: Task) -> tuple[int, int]:
     return single_pending, grouped_pending
 
 
+def parse_include_keywords(raw: Optional[str]) -> list[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,\n]", raw)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def filter_summary(task_filter: TaskFilter) -> str:
+    kw_count = len(parse_include_keywords(task_filter.include_keywords))
     return (
         f"图片:{'开' if task_filter.require_photo else '关'} | "
         f"视频:{'开' if task_filter.require_video else '关'} | "
-        f"仅保留纯文字:{'开' if task_filter.require_text else '关'} | "
+        f"排除纯文字:{'开' if task_filter.require_text else '关'} | "
         f"排除链接:{'开' if task_filter.exclude_links else '关'} | "
         f"排除无字:{'开' if task_filter.exclude_no_text else '关'} | "
         f"排除转发:{'开' if task_filter.exclude_forwarded else '关'} | "
         f"排除贴纸:{'开' if task_filter.exclude_sticker else '关'} | "
         f"排除投票:{'开' if task_filter.exclude_poll else '关'} | "
-        f"最短:{task_filter.min_text_length or '无'} 最长:{task_filter.max_text_length or '无'}"
+        f"包含关键词:{'开' if task_filter.include_keywords_enabled else '关'}({kw_count})"
     )
 
 
@@ -795,7 +805,7 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
         f"下次可发布剩余: {next_publish_in_seconds}s\n\n"
         f"日上限: {task.daily_limit}\n"
         f"发布时段: {task.active_start_time}-{task.active_end_time}\n"
-        f"任务接收源消息: {bool_cn(task.auto_capture_enabled)}\n"
+        f"任务监听源消息: {bool_cn(task.auto_capture_enabled)}\n"
         f"发布后删除源消息: {bool_cn(task.delete_after_success)}\n"
         f"下一条待发布: {next_pending_id if next_pending_id is not None else '无'}\n\n"
         f"过滤: {filter_summary(task_filter)}"
@@ -803,7 +813,20 @@ def build_task_detail_text(session, task: Task, source_name: Optional[str] = Non
 
 
 def task_detail_keyboard(task_id: int):
-    with_name = f"✏️ 名称"
+    with_name = "✏️ 名称"
+    with SessionLocal() as session:
+        task = session.get(Task, task_id)
+    mode_btn = "🧭 切换模式"
+    capture_btn = "📡 监听状态"
+    delete_btn = "🧹 是否删源"
+    interval_btn = "⏱ 间隔"
+    daily_btn = "📊 日上限"
+    if task:
+        mode_btn = "🧭 复制模式（当前）" if task.mode == TaskModeEnum.copy else "🧭 转载模式（当前）"
+        capture_btn = f"📡 监听状态（{'开' if task.auto_capture_enabled else '关'}）"
+        delete_btn = f"🧹 是否删源（{'是' if task.delete_after_success else '否'}）"
+        interval_btn = f"⏱ 间隔（{task.interval_seconds}秒）"
+        daily_btn = f"📊 日上限（{task.daily_limit}）"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("—— 高频操作 ——", callback_data="noop")],
@@ -811,11 +834,11 @@ def task_detail_keyboard(task_id: int):
             [InlineKeyboardButton("🚀 立即发布", callback_data=f"task_publish:{task_id}"), InlineKeyboardButton("📥 导入范围", callback_data=f"task_import_hint:{task_id}")],
             [InlineKeyboardButton("—— 配置操作 ——", callback_data="noop")],
             [InlineKeyboardButton(with_name, callback_data=f"task_edit_name:{task_id}"), InlineKeyboardButton("🔁 重试失败", callback_data=f"task_retry:{task_id}")],
-            [InlineKeyboardButton("🧭 切换模式", callback_data=f"task_toggle_mode:{task_id}"), InlineKeyboardButton("📡 接收开关", callback_data=f"task_toggle_auto_capture:{task_id}")],
-            [InlineKeyboardButton("🧹 删源开关", callback_data=f"task_toggle_delete:{task_id}"), InlineKeyboardButton("🔍 过滤设置", callback_data=f"task_filters:{task_id}")],
-            [InlineKeyboardButton("⏱ 间隔", callback_data=f"task_input_interval:{task_id}"), InlineKeyboardButton("📊 日上限", callback_data=f"task_input_daily:{task_id}")],
+            [InlineKeyboardButton(mode_btn, callback_data=f"task_toggle_mode:{task_id}"), InlineKeyboardButton(capture_btn, callback_data=f"task_toggle_auto_capture:{task_id}")],
+            [InlineKeyboardButton(delete_btn, callback_data=f"task_toggle_delete:{task_id}"), InlineKeyboardButton("🔍 过滤设置", callback_data=f"task_filters:{task_id}")],
+            [InlineKeyboardButton(interval_btn, callback_data=f"task_input_interval:{task_id}"), InlineKeyboardButton(daily_btn, callback_data=f"task_input_daily:{task_id}")],
             [InlineKeyboardButton("🕒 时段", callback_data=f"task_input_window:{task_id}")],
-            [InlineKeyboardButton("🧷 来源ID", callback_data=f"task_edit_source:{task_id}"), InlineKeyboardButton("🎯 目标ID", callback_data=f"task_edit_target:{task_id}")],
+            [InlineKeyboardButton("🧷 来源ID修改", callback_data=f"task_edit_source:{task_id}"), InlineKeyboardButton("🎯 目标ID修改", callback_data=f"task_edit_target:{task_id}")],
             [InlineKeyboardButton("🧾 最近日志(5条)", callback_data=f"task_recent_logs:{task_id}"), InlineKeyboardButton("🔄 刷新", callback_data=f"task_view:{task_id}")],
             [InlineKeyboardButton("—— 危险操作 ——", callback_data="noop")],
             [InlineKeyboardButton("♻️ 重置任务", callback_data=f"task_reset_ask:{task_id}"), InlineKeyboardButton("🗑 删除任务", callback_data=f"task_delete_ask:{task_id}")],
@@ -826,35 +849,26 @@ def task_detail_keyboard(task_id: int):
 
 def task_filters_keyboard(task_id: int, task_filter: TaskFilter):
     def on_off(value: bool) -> str:
-        return "on" if value else "off"
+        return "🟢" if value else "⚪️"
+    kw_count = len(parse_include_keywords(task_filter.include_keywords))
 
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(f"🖼 图片 {on_off(task_filter.require_photo)}", callback_data=f"task_filter_toggle:{task_id}:require_photo"),
-                InlineKeyboardButton(f"🎬 视频 {on_off(task_filter.require_video)}", callback_data=f"task_filter_toggle:{task_id}:require_video"),
+                InlineKeyboardButton(f"{on_off(task_filter.require_photo)} 🖼 必须含图片", callback_data=f"task_filter_toggle:{task_id}:require_photo"),
+                InlineKeyboardButton(f"{on_off(task_filter.require_video)} 🎬 必须含视频", callback_data=f"task_filter_toggle:{task_id}:require_video"),
             ],
             [
-                InlineKeyboardButton(f"📝 仅保留纯文字 {on_off(task_filter.require_text)}", callback_data=f"task_filter_toggle:{task_id}:require_text"),
-                InlineKeyboardButton(f"🔗 排链 {on_off(task_filter.exclude_links)}", callback_data=f"task_filter_toggle:{task_id}:exclude_links"),
+                InlineKeyboardButton(f"{on_off(task_filter.require_text)} 📝 排除纯文字", callback_data=f"task_filter_toggle:{task_id}:require_text"),
+                InlineKeyboardButton(f"{on_off(task_filter.exclude_links)} 🔗 排除链接", callback_data=f"task_filter_toggle:{task_id}:exclude_links"),
             ],
             [
-                InlineKeyboardButton(f"🙈 无字 {on_off(task_filter.exclude_no_text)}", callback_data=f"task_filter_toggle:{task_id}:exclude_no_text"),
-                InlineKeyboardButton(f"↪️ 转发 {on_off(task_filter.exclude_forwarded)}", callback_data=f"task_filter_toggle:{task_id}:exclude_forwarded"),
+                InlineKeyboardButton(f"{on_off(task_filter.include_keywords_enabled)} 🏷 包含关键词({kw_count})", callback_data=f"task_filter_toggle:{task_id}:include_keywords_enabled"),
+                InlineKeyboardButton("✍️ 设置关键词", callback_data=f"task_filter_keywords_input:{task_id}"),
             ],
             [
-                InlineKeyboardButton(f"🏷 贴纸 {on_off(task_filter.exclude_sticker)}", callback_data=f"task_filter_toggle:{task_id}:exclude_sticker"),
-                InlineKeyboardButton(f"📊 投票 {on_off(task_filter.exclude_poll)}", callback_data=f"task_filter_toggle:{task_id}:exclude_poll"),
-            ],
-            [
-                InlineKeyboardButton("min=10", callback_data=f"task_filter_min:{task_id}:10"),
-                InlineKeyboardButton("min=30", callback_data=f"task_filter_min:{task_id}:30"),
-                InlineKeyboardButton("min=关闭", callback_data=f"task_filter_min_off:{task_id}"),
-            ],
-            [
-                InlineKeyboardButton("max=100", callback_data=f"task_filter_max:{task_id}:100"),
-                InlineKeyboardButton("max=300", callback_data=f"task_filter_max:{task_id}:300"),
-                InlineKeyboardButton("max=关闭", callback_data=f"task_filter_max_off:{task_id}"),
+                InlineKeyboardButton(f"{on_off(task_filter.exclude_no_text)} 🙈 排除无字", callback_data=f"task_filter_toggle:{task_id}:exclude_no_text"),
+                InlineKeyboardButton(f"{on_off(task_filter.exclude_forwarded)} ↪️ 排除转发", callback_data=f"task_filter_toggle:{task_id}:exclude_forwarded"),
             ],
             [InlineKeyboardButton("⬅️ 返回任务详情", callback_data=f"task_view:{task_id}"), InlineKeyboardButton("🏠 主菜单", callback_data="menu_home")],
         ]
@@ -889,7 +903,7 @@ def apply_filters(item: QueueItem, task_filter: TaskFilter) -> Optional[str]:
     checks = [
         (task_filter.require_photo and not bool(item.has_photo), "需要图片"),
         (task_filter.require_video and not bool(item.has_video), "需要视频"),
-        (task_filter.require_text and not bool(item.has_text), "仅保留纯文字"),
+        (task_filter.require_text and item.message_type == "text", "纯文字"),
         (task_filter.exclude_links and bool(item.has_links), "包含链接"),
         (task_filter.exclude_no_text and not bool(item.has_text), "无文字"),
         (task_filter.exclude_forwarded and bool(item.is_forwarded), "转发消息"),
@@ -901,6 +915,12 @@ def apply_filters(item: QueueItem, task_filter: TaskFilter) -> Optional[str]:
     for flag, reason in checks:
         if flag:
             return reason
+    if task_filter.include_keywords_enabled:
+        keywords = parse_include_keywords(task_filter.include_keywords)
+        if keywords:
+            haystack = (item.text_preview or "").lower()
+            if not any(kw.lower() in haystack for kw in keywords):
+                return "未命中包含关键词"
     return None
 
 
@@ -1609,8 +1629,8 @@ def main_menu_keyboard():
 def main_menu_text() -> str:
     return (
         "欢迎使用 sosoFlow 🚚\n\n"
-        "简介：\n"
-        "• 轻量 Telegram 多任务搬运机器人\n"
+        "机器人简介：\n"
+        "• 轻量 Telegram 多任务转发机器人\n"
         "• 支持源监听池、范围发布、媒体组整体转发、失败重试\n\n"
         "官方频道：\n"
         "• https://t.me/sosoFlow\n\n"
@@ -1619,12 +1639,11 @@ def main_menu_text() -> str:
         "• 新建任务：按提示输入来源ID和目标ID（也可直接转发自动识别）\n"
         "• 获取频道/群ID：转发消息给我自动识别\n\n"
         "常用命令：\n"
+        "• /start 新建任务\n"
         "• /tasks 查看任务列表\n"
         "• /task_status 查看当前任务详情\n"
-        "• /import_range <start> <end> 设定发布范围\n"
         "• /publish_now 立即发布下一条\n"
-        "• /status 查看系统状态\n"
-        "• /help 查看完整命令帮助"
+        "• /status 查看系统状态"
     )
 
 
@@ -2552,6 +2571,7 @@ async def set_filter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "exclude_forwarded",
         "exclude_sticker",
         "exclude_poll",
+        "include_keywords_enabled",
     }
     with SessionLocal() as session:
         task_filter = ensure_task_filter(session, task.id)
@@ -2946,6 +2966,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "exclude_forwarded",
                 "exclude_sticker",
                 "exclude_poll",
+                "include_keywords_enabled",
             }
             if key not in allowed:
                 await query.answer("未知过滤键", show_alert=True)
@@ -2955,6 +2976,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             await query.edit_message_reply_markup(reply_markup=task_filters_keyboard(task.id, task_filter))
             await query.message.reply_text(f"✅ 已更新过滤项：{key}")
+            return
+        elif action == "task_filter_keywords_input":
+            context.user_data["pending_input_action"] = "set_include_keywords"
+            context.user_data["pending_task_id"] = task.id
+            task_filter = ensure_task_filter(session, task.id)
+            current = parse_include_keywords(task_filter.include_keywords)
+            preview = "、".join(current[:8]) if current else "无"
+            await query.message.reply_text(
+                "✍️ 请输入包含关键词，多个关键词用逗号或换行分隔。\n"
+                "示例：抽奖,活动,新品\n"
+                f"当前关键词：{preview}"
+            )
             return
         elif action == "task_filter_min":
             if len(parts) != 3:
@@ -3431,6 +3464,32 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("pending_input_action", None)
         context.user_data.pop("pending_task_id", None)
         return True
+    if action == "set_include_keywords":
+        task_id = context.user_data.get("pending_task_id")
+        if not task_id:
+            await msg.reply_text("未找到任务，请重新进入过滤设置")
+            context.user_data.pop("pending_input_action", None)
+            return True
+        keywords = parse_include_keywords(text)
+        with SessionLocal() as session:
+            task = session.get(Task, task_id)
+            if not task:
+                await msg.reply_text("任务不存在")
+                context.user_data.pop("pending_input_action", None)
+                context.user_data.pop("pending_task_id", None)
+                return True
+            task_filter = ensure_task_filter(session, task.id)
+            task_filter.include_keywords = "\n".join(keywords) if keywords else None
+            write_config_log(session, task.id, f"输入设置包含关键词 count={len(keywords)}")
+            session.commit()
+            session.refresh(task_filter)
+            await msg.reply_text(
+                f"✅ 包含关键词已更新（{len(keywords)}）",
+                reply_markup=task_filters_keyboard(task.id, task_filter),
+            )
+        context.user_data.pop("pending_input_action", None)
+        context.user_data.pop("pending_task_id", None)
+        return True
     return False
 
 
@@ -3750,6 +3809,13 @@ def init_db():
         if "next_retry_at" not in columns:
             next_retry_type = "TIMESTAMP" if database_type(env.database_url) == "postgresql" else "DATETIME"
             conn.execute(sql_text(f"ALTER TABLE queue ADD COLUMN next_retry_at {next_retry_type}"))
+    task_filter_columns = {col["name"] for col in inspector.get_columns("task_filters")}
+    with engine.begin() as conn:
+        if "include_keywords_enabled" not in task_filter_columns:
+            conn.execute(sql_text("ALTER TABLE task_filters ADD COLUMN include_keywords_enabled BOOLEAN DEFAULT FALSE"))
+            conn.execute(sql_text("UPDATE task_filters SET include_keywords_enabled = FALSE WHERE include_keywords_enabled IS NULL"))
+        if "include_keywords" not in task_filter_columns:
+            conn.execute(sql_text("ALTER TABLE task_filters ADD COLUMN include_keywords TEXT"))
     gs_columns = {col["name"] for col in inspector.get_columns("global_settings")}
     with engine.begin() as conn:
         if "debug_media_updates" not in gs_columns:
