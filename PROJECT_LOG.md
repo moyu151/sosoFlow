@@ -141,6 +141,20 @@
 
 ### 增量更新（本次）
 
+- 监听源列表增强：
+  - `/sources` 每一行增加源名称展示（可获取时显示 `chat_id（名称）`，获取失败回退仅显示 `chat_id`）
+- 文案中文化（用户可见状态字段）：
+  - `/status` 中 `pending/pending_media_groups/waiting` 改为 `待发布/待发布媒体组/等待重试`
+  - `/retry_failed`、`/retry_waiting` 成功提示改为中文表达（“已重置失败/等待为待发布”）
+  - `/debug_queue` 输出中的 `status=` 字段名改为 `状态=`
+- 版本记录机制落地（解决启动通知 `版本: unknown`）：
+  - 新增根目录 `VERSION` 文件（当前值：`0.1.0`）
+  - `load_env` 改为通过 `resolve_deploy_version` 解析版本号，优先级：
+    1) `DEPLOY_VERSION` 环境变量
+    2) 根目录 `VERSION` 文件
+    3) `GIT_COMMIT` 环境变量
+    4) 回退 `unknown`
+  - `README.md` 增加版本来源优先级说明，便于部署时统一管理版本标识
 - 修复“/import_range 大范围占位ID阻塞新帖及时发布”：
   - 根因：发布选择始终按最小 `message_id` 取 `pending`，会优先消耗 `message_type=unknown` 的历史占位项
   - 处理：`pick_next_publish_item` 增加优先级，先选“实时捕获项（`message_type != unknown`）”，再回退占位项

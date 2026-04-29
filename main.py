@@ -268,6 +268,31 @@ def normalize_database_url(value: str) -> str:
     return raw
 
 
+def read_version_file() -> str:
+    version_path = os.path.join(os.getcwd(), "VERSION")
+    try:
+        if not os.path.exists(version_path):
+            return ""
+        with open(version_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as exc:
+        logger.warning("read VERSION file failed: %s", exc)
+        return ""
+
+
+def resolve_deploy_version() -> str:
+    explicit = os.getenv("DEPLOY_VERSION", "").strip()
+    if explicit:
+        return explicit
+    version_file = read_version_file()
+    if version_file:
+        return version_file
+    git_commit = os.getenv("GIT_COMMIT", "").strip()
+    if git_commit:
+        return git_commit
+    return "unknown"
+
+
 def load_env() -> AppEnv:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -279,7 +304,7 @@ def load_env() -> AppEnv:
         admin_user_ids=parse_ids(os.getenv("ADMIN_USER_IDS", "")),
         database_url=normalize_database_url(raw_database_url) or "sqlite:////mnt/sosoflow/sosoflow.db",
         tz=os.getenv("TZ", "Asia/Shanghai"),
-        deploy_version=os.getenv("DEPLOY_VERSION", "").strip() or os.getenv("GIT_COMMIT", "").strip() or "unknown",
+        deploy_version=resolve_deploy_version(),
         startup_notify_chat_ids=parse_ids(os.getenv("STARTUP_NOTIFY_CHAT_IDS", "")),
         restart_strategy=os.getenv("RESTART_STRATEGY", "guide").strip().lower(),
         debug_media_updates=parse_bool_env(os.getenv("DEBUG_MEDIA_UPDATES", ""), default=False),
@@ -1854,9 +1879,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 系统状态\n"
         f"任务总数: {task_count}\n"
         f"运行中: {enabled_count}\n"
-        f"pending: {queue_pending}\n"
-        f"pending_media_groups: {pending_group_units}\n"
-        f"waiting: {queue_waiting}\n"
+        f"待发布: {queue_pending}\n"
+        f"待发布媒体组: {pending_group_units}\n"
+        f"等待重试: {queue_waiting}\n"
         f"今日发布: {today_published}\n"
         f"今日失败: {today_failed}\n"
         f"累计失败: {failed_total}\n"
@@ -2109,7 +2134,7 @@ async def retry_failed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row.fail_reason = None
                 row.next_retry_at = None
             session.commit()
-            await update.message.reply_text(f"✅ 已重置 failed/waiting -> pending: {len(tms_rows)}")
+            await update.message.reply_text(f"✅ 已重置失败/等待为待发布: {len(tms_rows)}")
             return
         base_rows = session.scalars(
             select(QueueItem).where(
@@ -2123,7 +2148,7 @@ async def retry_failed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.fail_reason = None
             row.next_retry_at = None
         session.commit()
-    await update.message.reply_text(f"✅ 已重置 failed/waiting -> pending: {len(rows)}")
+    await update.message.reply_text(f"✅ 已重置失败/等待为待发布: {len(rows)}")
 
 
 @require_admin
@@ -2162,7 +2187,7 @@ async def retry_waiting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row.fail_reason = None
                 row.next_retry_at = None
             session.commit()
-            await update.message.reply_text(f"✅ 已重置 waiting -> pending: {len(tms_rows)}")
+            await update.message.reply_text(f"✅ 已重置等待为待发布: {len(tms_rows)}")
             return
         base_rows = session.scalars(select(QueueItem).where(QueueItem.task_id == task.id, QueueItem.status == QueueStatusEnum.waiting)).all()
         rows = expand_rows_by_media_group(session, base_rows)
@@ -2171,7 +2196,7 @@ async def retry_waiting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row.fail_reason = None
             row.next_retry_at = None
         session.commit()
-    await update.message.reply_text(f"✅ 已重置 waiting -> pending: {len(rows)}")
+    await update.message.reply_text(f"✅ 已重置等待为待发布: {len(rows)}")
 
 
 async def set_current_task_simple(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, value):
@@ -2397,7 +2422,7 @@ async def debug_queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"message_id={row.message_id}\n"
             f"media_group_id={row.media_group_id or 'None'}\n"
             f"file_id_exists={bool(row.file_id)}\n"
-            f"status={row.status.value}\n"
+            f"状态={row.status.value}\n"
             f"message_type={row.message_type or 'unknown'}\n"
             f"caption_exists={bool(row.caption)}\n"
             f"retry_count={row.retry_count}\n"
@@ -2415,7 +2440,9 @@ async def sources_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📡 监听源列表"]
     for row in rows[:50]:
         latest = row.latest_seen_message_id if row.latest_seen_message_id is not None else "-"
-        lines.append(f"{'🟢' if row.enabled else '⏸'} {row.source_chat_id} latest={latest}")
+        source_name = await resolve_chat_display_name(context.application, row.source_chat_id)
+        source_line = f"{row.source_chat_id}" if not source_name else f"{row.source_chat_id}（{source_name}）"
+        lines.append(f"{'🟢' if row.enabled else '⏸'} {source_line} latest={latest}")
     await update.message.reply_text("\n".join(lines))
 
 
