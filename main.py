@@ -821,12 +821,14 @@ def task_detail_keyboard(task_id: int):
     delete_btn = "🧹 是否删源"
     interval_btn = "⏱ 间隔"
     daily_btn = "📊 日上限"
+    window_btn = "🕒 时段"
     if task:
-        mode_btn = "🧭 复制模式（当前）" if task.mode == TaskModeEnum.copy else "🧭 转载模式（当前）"
+        mode_btn = "🧭 当前模式（复制）" if task.mode == TaskModeEnum.copy else "🧭 当前模式（转发）"
         capture_btn = f"📡 监听状态（{'开' if task.auto_capture_enabled else '关'}）"
         delete_btn = f"🧹 是否删源（{'是' if task.delete_after_success else '否'}）"
         interval_btn = f"⏱ 间隔（{task.interval_seconds}秒）"
         daily_btn = f"📊 日上限（{task.daily_limit}）"
+        window_btn = f"🕒 时段（{task.active_start_time}-{task.active_end_time}）"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("—— 高频操作 ——", callback_data="noop")],
@@ -837,7 +839,7 @@ def task_detail_keyboard(task_id: int):
             [InlineKeyboardButton(mode_btn, callback_data=f"task_toggle_mode:{task_id}"), InlineKeyboardButton(capture_btn, callback_data=f"task_toggle_auto_capture:{task_id}")],
             [InlineKeyboardButton(delete_btn, callback_data=f"task_toggle_delete:{task_id}"), InlineKeyboardButton("🔍 过滤设置", callback_data=f"task_filters:{task_id}")],
             [InlineKeyboardButton(interval_btn, callback_data=f"task_input_interval:{task_id}"), InlineKeyboardButton(daily_btn, callback_data=f"task_input_daily:{task_id}")],
-            [InlineKeyboardButton("🕒 时段", callback_data=f"task_input_window:{task_id}")],
+            [InlineKeyboardButton(window_btn, callback_data=f"task_input_window:{task_id}")],
             [InlineKeyboardButton("🧷 来源ID修改", callback_data=f"task_edit_source:{task_id}"), InlineKeyboardButton("🎯 目标ID修改", callback_data=f"task_edit_target:{task_id}")],
             [InlineKeyboardButton("🧾 最近日志(5条)", callback_data=f"task_recent_logs:{task_id}"), InlineKeyboardButton("🔄 刷新", callback_data=f"task_view:{task_id}")],
             [InlineKeyboardButton("—— 危险操作 ——", callback_data="noop")],
@@ -2027,11 +2029,11 @@ async def import_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db_task:
             await update.message.reply_text("任务不存在")
             return
+        requested_end_id = end_id
         registry = session.scalar(select(SourceRegistry).where(SourceRegistry.source_chat_id == db_task.source_chat_id))
         latest_seen = registry.latest_seen_message_id if registry and registry.latest_seen_message_id is not None else None
-        if latest_seen is not None and end_id > latest_seen:
-            end_id = latest_seen
-        if start_id > end_id:
+        effective_end_id = min(requested_end_id, latest_seen) if latest_seen is not None else requested_end_id
+        if start_id > effective_end_id:
             await update.message.reply_text("范围无可导入消息（当前源最新消息ID更小）")
             return
         src_rows = session.scalars(
@@ -2039,20 +2041,20 @@ async def import_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 SourceMessage.source_chat_id == db_task.source_chat_id,
                 SourceMessage.state == SourceMessageStateEnum.observed,
                 SourceMessage.message_id >= start_id,
-                SourceMessage.message_id <= end_id,
+                SourceMessage.message_id <= effective_end_id,
             ).order_by(SourceMessage.message_id.asc())
         ).all()
         db_task.range_start_message_id = start_id
-        db_task.range_end_message_id = end_id
+        db_task.range_end_message_id = requested_end_id
         db_task.is_completed = False
         db_task.completed_at = None
-        write_config_log(session, db_task.id, f"设置发布范围 {start_id}-{end_id}")
+        write_config_log(session, db_task.id, f"设置发布范围 {start_id}-{requested_end_id}")
         session.commit()
     observed_count = len(src_rows)
-    missing_known = (end_id - start_id + 1) - observed_count
+    missing_known = (requested_end_id - start_id + 1) - observed_count
     await update.message.reply_text(
         f"✅ 导入完成\n"
-        f"范围已设定: {start_id}-{end_id}\n"
+        f"范围已设定: {start_id}-{requested_end_id}\n"
         f"监听池已观测: {observed_count}\n"
         f"未观测跳过: {missing_known}"
     )
@@ -3227,11 +3229,11 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("pending_input_action", None)
                 context.user_data.pop("pending_task_id", None)
                 return True
+            requested_end_id = end_id
             registry = session.scalar(select(SourceRegistry).where(SourceRegistry.source_chat_id == task.source_chat_id))
             latest_seen = registry.latest_seen_message_id if registry and registry.latest_seen_message_id is not None else None
-            if latest_seen is not None and end_id > latest_seen:
-                end_id = latest_seen
-            if start_id > end_id:
+            effective_end_id = min(requested_end_id, latest_seen) if latest_seen is not None else requested_end_id
+            if start_id > effective_end_id:
                 await msg.reply_text("范围无可导入消息（当前源最新消息ID更小）")
                 return True
             src_rows = session.scalars(
@@ -3239,20 +3241,20 @@ async def handle_pending_input(update: Update, context: ContextTypes.DEFAULT_TYP
                     SourceMessage.source_chat_id == task.source_chat_id,
                     SourceMessage.state == SourceMessageStateEnum.observed,
                     SourceMessage.message_id >= start_id,
-                    SourceMessage.message_id <= end_id,
+                    SourceMessage.message_id <= effective_end_id,
                 ).order_by(SourceMessage.message_id.asc())
             ).all()
             task.range_start_message_id = start_id
-            task.range_end_message_id = end_id
+            task.range_end_message_id = requested_end_id
             task.is_completed = False
             task.completed_at = None
-            write_config_log(session, task.id, f"输入设置发布范围 {start_id}-{end_id}")
+            write_config_log(session, task.id, f"输入设置发布范围 {start_id}-{requested_end_id}")
             session.commit()
         observed_count = len(src_rows)
-        missing_known = (end_id - start_id + 1) - observed_count
+        missing_known = (requested_end_id - start_id + 1) - observed_count
         await msg.reply_text(
             f"✅ 导入完成\n"
-            f"范围已设定: {start_id}-{end_id}\n"
+            f"范围已设定: {start_id}-{requested_end_id}\n"
             f"监听池已观测: {observed_count}\n"
             f"未观测跳过: {missing_known}"
         )
