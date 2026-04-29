@@ -631,3 +631,58 @@
 ### 下一步建议（最高优先）
 
 - 在任务详情“模式/状态”下方增加一行固定提示：`消息采集由源监听池统一负责，任务启动后自动消费`，进一步减少认知歧义。
+
+### 增量更新（编辑重发默认开启 + 启动补偿）
+
+- 编辑重发默认值调整：
+  - `Task.recapture_on_edit_enabled` 默认由 `False` 改为 `True`
+  - 旧库补列迁移默认值改为 `TRUE`（并将 `NULL` 回填为 `TRUE`）
+  - 任务重置时该开关恢复为 `True`
+- 修复“已编辑但任务启动后未拿到”的场景：
+  - 新增 `requeue_edited_items_for_task(session, task)`
+  - 任务启动（命令 `/start_task` 与按钮启动）时会执行一次补偿扫描：
+    - 若 `source_messages.updated_at > queue.updated_at`
+    - 且队列状态为 `published/skipped`
+    - 则回退为 `pending` 并同步最新元数据（文本/媒体/file_id/media_group_id）
+  - 启动提示会显示回补数量（如有）
+- 说明：
+  - 实时编辑更新仍走原监听链路即时回退
+  - 补偿扫描用于兜底（例如编辑事件与任务状态切换时序导致的漏回退）
+- 本轮改动文件：
+  - `main.py`
+  - `PROJECT_LOG.md`
+
+### 已验证项
+
+- `python -m py_compile main.py` 通过
+- `pytest -q` 通过（45 passed）
+
+### 下一步建议（最高优先）
+
+- 为 `/debug_queue` 增加 `updated_at` 与 `source_updated_at` 对比展示，便于现场判断“是否命中编辑补偿条件”。
+
+### 增量更新（转发来源消息发布兜底）
+
+- 修复场景：源频道中“转发自其它频道/群组”的消息，在 `copy/forward` 路径失败时无法发布
+- 新增单条消息发布兜底：
+  - 当 `copy_message/forward_message` 抛出常见权限/复制受限错误时
+  - 自动尝试基于已采集元数据直接发送：
+    - `photo` -> `send_photo(file_id, caption)`
+    - `video` -> `send_video(file_id, caption)`
+    - `document` -> `send_document(file_id, caption)`
+    - `text` -> `send_message(text)`（使用已采集文本）
+  - 兜底成功后记日志 `publish_method=direct_send_fallback`
+  - 兜底失败会合并到失败原因中，继续原失败/重试流程
+- 影响范围：仅单条发布路径；媒体组路径不变（仍优先 `send_media_group`）
+- 本轮改动文件：
+  - `main.py`
+  - `PROJECT_LOG.md`
+
+### 已验证项
+
+- `python -m py_compile main.py` 通过
+- `pytest -q` 通过（45 passed）
+
+### 下一步建议（最高优先）
+
+- 在任务“最近日志”里补充展示 `publish_method`（copy/forward/send_media_group/direct_send_fallback），便于快速判断是主路径还是兜底路径生效。

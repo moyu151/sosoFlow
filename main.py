@@ -105,7 +105,7 @@ class Task(Base):
     active_end_time: Mapped[str] = mapped_column(String(5), default="23:59")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_capture_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    recapture_on_edit_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    recapture_on_edit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     delete_after_success: Mapped[bool] = mapped_column(Boolean, default=False)
     range_start_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     range_end_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
@@ -1423,6 +1423,78 @@ def upsert_queue_item_from_capture(
     )
 
 
+def requeue_edited_items_for_task(session, task: Task) -> int:
+    if not task.recapture_on_edit_enabled:
+        return 0
+    q = (
+        select(QueueItem, SourceMessage)
+        .join(
+            SourceMessage,
+            and_(
+                SourceMessage.source_chat_id == task.source_chat_id,
+                SourceMessage.message_id == QueueItem.message_id,
+            ),
+        )
+        .where(
+            QueueItem.task_id == task.id,
+            QueueItem.status.in_([QueueStatusEnum.published, QueueStatusEnum.skipped]),
+            SourceMessage.state == SourceMessageStateEnum.observed,
+            SourceMessage.updated_at > QueueItem.updated_at,
+        )
+    )
+    rows = session.execute(q).all()
+    changed = 0
+    for item, src in rows:
+        item.status = QueueStatusEnum.pending
+        item.target_message_id = None
+        item.published_at = None
+        item.deleted_at = None
+        item.fail_reason = None
+        item.filter_reason = None
+        item.retry_count = 0
+        item.next_retry_at = None
+        item.message_type = src.message_type
+        item.file_id = src.file_id
+        item.caption = src.caption
+        item.text_preview = src.text_preview
+        item.has_text = src.has_text
+        item.has_photo = src.has_photo
+        item.has_video = src.has_video
+        item.has_document = src.has_document
+        item.has_links = src.has_links
+        item.is_forwarded = src.is_forwarded
+        item.media_group_id = src.media_group_id
+        upsert_task_message_state_from_queue_item(session, task.id, task.source_chat_id, item)
+        changed += 1
+    return changed
+
+
+def should_try_direct_send_fallback(raw_err: str) -> bool:
+    t = (raw_err or "").lower()
+    hints = [
+        "can't be copied",
+        "message can't be copied",
+        "can't be forwarded",
+        "message can't be forwarded",
+        "have no rights to send",
+        "forbidden",
+    ]
+    return any(h in t for h in hints)
+
+
+async def direct_send_from_captured_item(application: Application, target_chat_id: int, item: QueueItem):
+    text_value = (item.caption or item.text_preview or "").strip()
+    if item.message_type == "photo" and item.file_id:
+        return await application.bot.send_photo(chat_id=target_chat_id, photo=item.file_id, caption=text_value or None)
+    if item.message_type == "video" and item.file_id:
+        return await application.bot.send_video(chat_id=target_chat_id, video=item.file_id, caption=text_value or None)
+    if item.message_type == "document" and item.file_id:
+        return await application.bot.send_document(chat_id=target_chat_id, document=item.file_id, caption=text_value or None)
+    if item.message_type == "text" and text_value:
+        return await application.bot.send_message(chat_id=target_chat_id, text=text_value)
+    return None
+
+
 async def publish_one(application: Application, task: Task, ignore_interval: bool = False, ignore_window: bool = False) -> str:
     with SessionLocal() as session:
         db_task = session.get(Task, task.id)
@@ -1586,6 +1658,33 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     "可改用 forward 模式或检查源频道权限）"
                 )
             should_waiting = is_retryable_missing_message_error(raw_err)
+            if (not is_media_group_unit) and should_try_direct_send_fallback(raw_err):
+                try:
+                    sent_fallback = await direct_send_from_captured_item(application, db_task.target_chat_id, item)
+                    if sent_fallback:
+                        target_id = getattr(sent_fallback, "message_id", None)
+                        item.status = QueueStatusEnum.published
+                        item.target_message_id = target_id
+                        item.published_at = now()
+                        item.fail_reason = None
+                        item.next_retry_at = None
+                        item.filter_reason = None
+                        db_task.last_published_at = now()
+                        write_log(session, db_task.id, item.message_id, target_id, "publish", "发布成功 publish_method=direct_send_fallback")
+                        if db_task.delete_after_success:
+                            deleted, reason = await try_delete_source_message_if_ready(
+                                application=application,
+                                session=session,
+                                source_chat_id=db_task.source_chat_id,
+                                message_id=item.message_id,
+                            )
+                            if not deleted:
+                                write_log(session, db_task.id, item.message_id, None, "delete_defer", f"暂不删源: {reason}")
+                        upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, item)
+                        session.commit()
+                        return f"发布成功 message_id={item.message_id} method=direct_send_fallback"
+                except Exception as fallback_exc:
+                    fail_msg = f"{fail_msg}；fallback失败: {fallback_exc}"
             if is_media_group_unit:
                 for album_item in publish_unit_rows:
                     if should_waiting:
@@ -2538,14 +2637,19 @@ async def _delayed_restart_or_exit(exec_mode: bool):
 async def start_task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = await set_current_task_simple(update, context, "enabled", True)
     if task_id:
+        requeued = 0
         with SessionLocal() as session:
             db_task = session.get(Task, task_id)
             if db_task:
                 db_task.is_completed = False
                 db_task.completed_at = None
+                requeued = requeue_edited_items_for_task(session, db_task)
                 write_config_log(session, task_id, "手动启动任务")
                 session.commit()
-        await update.message.reply_text("✅ 任务已启动")
+        if requeued > 0:
+            await update.message.reply_text(f"✅ 任务已启动（已回补编辑重发 {requeued} 条）")
+        else:
+            await update.message.reply_text("✅ 任务已启动")
 
 
 @require_admin
@@ -2782,6 +2886,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task.enabled = True
             task.is_completed = False
             task.completed_at = None
+            requeued = requeue_edited_items_for_task(session, task)
             write_config_log(session, task.id, "按钮启动任务")
             session.commit()
             source_name = await resolve_chat_display_name(context.application, task.source_chat_id)
@@ -2791,7 +2896,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 build_task_detail_text(session, task, source_name=source_name, target_name=target_name),
                 reply_markup=task_detail_keyboard(task_id),
             )
-            await query.message.reply_text("✅ 已启动任务")
+            if requeued > 0:
+                await query.message.reply_text(f"✅ 已启动任务（已回补编辑重发 {requeued} 条）")
+            else:
+                await query.message.reply_text("✅ 已启动任务")
             return
         elif action == "task_pause":
             task.enabled = False
@@ -3095,7 +3203,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 task.active_end_time = "23:59"
                 task.enabled = False
                 task.auto_capture_enabled = True
-                task.recapture_on_edit_enabled = False
+                task.recapture_on_edit_enabled = True
                 task.delete_after_success = False
                 task.last_published_at = None
                 session.commit()
@@ -3829,8 +3937,8 @@ def init_db():
             completed_at_type = "TIMESTAMP" if database_type(env.database_url) == "postgresql" else "DATETIME"
             conn.execute(sql_text(f"ALTER TABLE tasks ADD COLUMN completed_at {completed_at_type}"))
         if "recapture_on_edit_enabled" not in task_columns:
-            conn.execute(sql_text("ALTER TABLE tasks ADD COLUMN recapture_on_edit_enabled BOOLEAN DEFAULT FALSE"))
-            conn.execute(sql_text("UPDATE tasks SET recapture_on_edit_enabled = FALSE WHERE recapture_on_edit_enabled IS NULL"))
+            conn.execute(sql_text("ALTER TABLE tasks ADD COLUMN recapture_on_edit_enabled BOOLEAN DEFAULT TRUE"))
+            conn.execute(sql_text("UPDATE tasks SET recapture_on_edit_enabled = TRUE WHERE recapture_on_edit_enabled IS NULL"))
     columns = {col["name"] for col in inspector.get_columns("queue")}
     with engine.begin() as conn:
         if "file_id" not in columns:
