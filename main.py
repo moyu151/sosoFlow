@@ -1666,6 +1666,62 @@ async def publish_one(application: Application, task: Task, ignore_interval: boo
                     "可改用 forward 模式或检查源频道权限）"
                 )
             should_waiting = is_retryable_missing_message_error(raw_err)
+            if is_media_group_unit and should_try_direct_send_fallback(raw_err):
+                try:
+                    sent_target_ids: list[Optional[int]] = []
+                    for album_item in publish_unit_rows:
+                        sent_fallback = await direct_send_from_captured_item(application, db_task.target_chat_id, album_item)
+                        if not sent_fallback:
+                            raise RuntimeError(f"direct_album_fallback_not_supported message_id={album_item.message_id}")
+                        target_id = getattr(sent_fallback, "message_id", None)
+                        sent_target_ids.append(target_id)
+                        # 先记录已发送标记，便于 fallback 中途失败时做“部分成功”收敛，避免后续重复发送。
+                        album_item.target_message_id = target_id
+                        album_item.status = QueueStatusEnum.published
+                    published_at = now()
+                    for i, album_item in enumerate(publish_unit_rows):
+                        target_id = sent_target_ids[i] if i < len(sent_target_ids) else None
+                        album_item.target_message_id = target_id
+                        album_item.published_at = published_at
+                        album_item.fail_reason = None
+                        album_item.next_retry_at = None
+                        album_item.filter_reason = None
+                        write_log(session, db_task.id, album_item.message_id, target_id, "publish", "发布成功 publish_method=direct_album_fallback")
+                        upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, album_item)
+                    db_task.last_published_at = published_at
+                    session.commit()
+                    return f"发布成功 media_group={item.media_group_id} count={len(publish_unit_rows)} method=direct_album_fallback"
+                except Exception as fallback_album_exc:
+                    # 避免部分成功后整组重试导致重复发布：已发送的标记 published，剩余失败。
+                    sent_count = 0
+                    fallback_msg = f"{fail_msg}；album_fallback失败: {fallback_album_exc}"
+                    for album_item in publish_unit_rows:
+                        if album_item.target_message_id is not None or album_item.status == QueueStatusEnum.published:
+                            sent_count += 1
+                    if sent_count > 0:
+                        partial_published_at = now()
+                        for album_item in publish_unit_rows:
+                            if album_item.target_message_id is not None or album_item.status == QueueStatusEnum.published:
+                                album_item.published_at = partial_published_at
+                                album_item.fail_reason = None
+                                album_item.next_retry_at = None
+                                write_log(
+                                    session,
+                                    db_task.id,
+                                    album_item.message_id,
+                                    album_item.target_message_id,
+                                    "publish",
+                                    "发布成功 publish_method=direct_album_fallback_partial",
+                                )
+                                upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, album_item)
+                                continue
+                            album_item.status = QueueStatusEnum.failed
+                            album_item.fail_reason = fallback_msg
+                            album_item.next_retry_at = None
+                            write_log(session, db_task.id, album_item.message_id, None, "fail", fallback_msg)
+                            upsert_task_message_state_from_queue_item(session, db_task.id, db_task.source_chat_id, album_item)
+                        session.commit()
+                        return f"部分发布 media_group={item.media_group_id} sent={sent_count}/{len(publish_unit_rows)}"
             if (not is_media_group_unit) and should_try_direct_send_fallback(raw_err):
                 try:
                     sent_fallback = await direct_send_from_captured_item(application, db_task.target_chat_id, item)

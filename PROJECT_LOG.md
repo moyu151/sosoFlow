@@ -708,3 +708,26 @@
 ### 下一步建议（最高优先）
 
 - 增加一条 `capture_skip reason=...` 结构化日志（例如源关闭/非源匹配/权限拒绝），便于快速区分“未收到更新”与“收到但未入队”。
+
+### 增量更新（媒体组 direct fallback）
+
+- 新增媒体组失败兜底：
+  - 当媒体组主路径（`send_media_group` 或 `copy_messages_fallback`）报错且命中可兜底错误时
+  - 按组内队列项逐条走 `file_id` 直发（`send_photo/send_video/send_document`，文本走 `send_message`）
+  - 全部成功：整组标记 `published`，日志 `publish_method=direct_album_fallback`
+- 增加部分成功收敛：
+  - 若兜底过程中中途失败，已发送项标记 `published`（`direct_album_fallback_partial`），未发送项标记 `failed`
+  - 避免整组重试导致已发项重复发布
+- 单条 direct fallback 保持不变（此前已上线）
+- 本轮改动文件：
+  - `main.py`
+  - `PROJECT_LOG.md`
+
+### 已验证项
+
+- `python -m py_compile main.py` 通过
+- `pytest -q` 通过（45 passed）
+
+### 下一步建议（最高优先）
+
+- 在 `/task_status` 或“最近日志”增加 `publish_method` 汇总计数（主路径/兜底路径），便于快速评估兜底命中率与稳定性。
