@@ -2566,6 +2566,7 @@ async def debug_queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"media_group_id={row.media_group_id or 'None'}\n"
             f"file_id_exists={bool(row.file_id)}\n"
             f"状态={row.status.value}\n"
+            f"skip_reason={row.filter_reason or 'None'}\n"
             f"message_type={row.message_type or 'unknown'}\n"
             f"caption_exists={bool(row.caption)}\n"
             f"retry_count={row.retry_count}\n"
@@ -3656,6 +3657,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = typed_msg or update.effective_message
     if not msg or not msg.chat:
         return
+    user_data = context.user_data if context.user_data is not None else {}
     # 频道消息(channel_post)没有 effective_user，不能走 require_admin 拦截。
     # 仅私聊入口需要管理员校验，频道/群消息按 source_chat_id + auto_capture 规则入队。
     if msg.chat.type == "private":
@@ -3666,11 +3668,11 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if msg.chat.type == "private" and msg.text:
         text = msg.text.strip()
         if text == "📋 任务列表":
-            context.user_data.pop("pending_input_action", None)
-            context.user_data.pop("pending_task_id", None)
-            context.user_data.pop("pending_task_source_chat_id", None)
-            context.user_data.pop("pending_window_start", None)
-            context.user_data.pop("pending_forward_media_group_id", None)
+            user_data.pop("pending_input_action", None)
+            user_data.pop("pending_task_id", None)
+            user_data.pop("pending_task_source_chat_id", None)
+            user_data.pop("pending_window_start", None)
+            user_data.pop("pending_forward_media_group_id", None)
             with SessionLocal() as session:
                 tasks = session.scalars(select(Task).order_by(Task.id.asc())).all()
             if not tasks:
@@ -3679,11 +3681,11 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await msg.reply_text(tasks_list_intro_text(), reply_markup=build_tasks_list_keyboard(tasks, page=0))
             return
         if text == "➕ 新建任务":
-            context.user_data.pop("pending_task_id", None)
-            context.user_data.pop("pending_task_source_chat_id", None)
-            context.user_data.pop("pending_window_start", None)
-            context.user_data.pop("pending_forward_media_group_id", None)
-            context.user_data["pending_input_action"] = "create_task_source"
+            user_data.pop("pending_task_id", None)
+            user_data.pop("pending_task_source_chat_id", None)
+            user_data.pop("pending_window_start", None)
+            user_data.pop("pending_forward_media_group_id", None)
+            user_data["pending_input_action"] = "create_task_source"
             await msg.reply_text("✍️ 请输入来源频道/群组ID\n示例：-1001111111111\n💡 可转发来源频道/群消息给机器人，点击识别出的数字复制后发送确认。")
             return
     handled = await handle_pending_input(update, context)
@@ -3691,32 +3693,32 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     forward_chat_id = extract_forward_chat_id(msg)
     if forward_chat_id is not None:
-        pending_action = context.user_data.get("pending_input_action")
+        pending_action = user_data.get("pending_input_action")
         if pending_action in {"create_task_source", "create_task_target", "edit_task_source", "edit_task_target"} and msg.media_group_id:
-            last_group_id = context.user_data.get("pending_forward_media_group_id")
+            last_group_id = user_data.get("pending_forward_media_group_id")
             if last_group_id == msg.media_group_id:
                 return
-            context.user_data["pending_forward_media_group_id"] = msg.media_group_id
-        if context.user_data.get("pending_input_action") == "create_task_source":
-            context.user_data["pending_task_source_chat_id"] = forward_chat_id
-            context.user_data["pending_input_action"] = "create_task_target"
+            user_data["pending_forward_media_group_id"] = msg.media_group_id
+        if user_data.get("pending_input_action") == "create_task_source":
+            user_data["pending_task_source_chat_id"] = forward_chat_id
+            user_data["pending_input_action"] = "create_task_target"
             await msg.reply_text(
                 f"✅ 已自动确认来源ID：{forward_chat_id}\n"
                 "✍️ 请输入目标频道/群组ID\n示例：-1002222222222\n"
                 "💡 可转发目标频道/群消息给机器人，点击识别出的数字复制后发送确认。"
             )
             return
-        if context.user_data.get("pending_input_action") == "create_task_target":
-            source_chat_id = context.user_data.get("pending_task_source_chat_id")
+        if user_data.get("pending_input_action") == "create_task_target":
+            source_chat_id = user_data.get("pending_task_source_chat_id")
             if source_chat_id is None:
-                context.user_data.pop("pending_input_action", None)
+                user_data.pop("pending_input_action", None)
                 await msg.reply_text("⚠️ 创建流程已失效，请重新点击“➕ 新建任务”。")
                 return
             target_chat_id = forward_chat_id
             if source_chat_id == target_chat_id:
                 warn_key = f"{source_chat_id}:{target_chat_id}:{msg.media_group_id or msg.message_id}"
-                if context.user_data.get("last_same_pair_warn_key") != warn_key:
-                    context.user_data["last_same_pair_warn_key"] = warn_key
+                if user_data.get("last_same_pair_warn_key") != warn_key:
+                    user_data["last_same_pair_warn_key"] = warn_key
                     await msg.reply_text("⚠️ 识别到来源ID与目标ID相同，请转发目标频道/群组消息或直接输入目标ID。")
                 return
             with SessionLocal() as session:
@@ -3728,10 +3730,10 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else:
                     state.current_task_id = task.id
                 session.commit()
-            context.user_data.pop("pending_input_action", None)
-            context.user_data.pop("pending_task_source_chat_id", None)
-            context.user_data.pop("last_same_pair_warn_key", None)
-            context.user_data.pop("pending_forward_media_group_id", None)
+            user_data.pop("pending_input_action", None)
+            user_data.pop("pending_task_source_chat_id", None)
+            user_data.pop("last_same_pair_warn_key", None)
+            user_data.pop("pending_forward_media_group_id", None)
             if created:
                 await msg.reply_text(
                     f"✅ 已自动确认目标ID并创建任务\nID={task.id}\n名称: {task.name}\n源: {source_chat_id}\n目标: {target_chat_id}",
@@ -3743,18 +3745,18 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     reply_markup=task_detail_keyboard(task.id),
                 )
             return
-        if context.user_data.get("pending_input_action") == "edit_task_source":
-            task_id = context.user_data.get("pending_task_id")
+        if user_data.get("pending_input_action") == "edit_task_source":
+            task_id = user_data.get("pending_task_id")
             if not task_id:
-                context.user_data.pop("pending_input_action", None)
+                user_data.pop("pending_input_action", None)
                 await msg.reply_text("未找到任务，请重新进入任务设置")
                 return
             with SessionLocal() as session:
                 task = session.get(Task, task_id)
                 if not task:
                     await msg.reply_text("任务不存在")
-                    context.user_data.pop("pending_input_action", None)
-                    context.user_data.pop("pending_task_id", None)
+                    user_data.pop("pending_input_action", None)
+                    user_data.pop("pending_task_id", None)
                     return
                 task.source_chat_id = forward_chat_id
                 session.commit()
@@ -3763,22 +3765,22 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     f"✅ 已自动确认并更新来源ID：{forward_chat_id}",
                     reply_markup=task_detail_keyboard(task.id),
                 )
-            context.user_data.pop("pending_input_action", None)
-            context.user_data.pop("pending_task_id", None)
-            context.user_data.pop("pending_forward_media_group_id", None)
+            user_data.pop("pending_input_action", None)
+            user_data.pop("pending_task_id", None)
+            user_data.pop("pending_forward_media_group_id", None)
             return
-        if context.user_data.get("pending_input_action") == "edit_task_target":
-            task_id = context.user_data.get("pending_task_id")
+        if user_data.get("pending_input_action") == "edit_task_target":
+            task_id = user_data.get("pending_task_id")
             if not task_id:
-                context.user_data.pop("pending_input_action", None)
+                user_data.pop("pending_input_action", None)
                 await msg.reply_text("未找到任务，请重新进入任务设置")
                 return
             with SessionLocal() as session:
                 task = session.get(Task, task_id)
                 if not task:
                     await msg.reply_text("任务不存在")
-                    context.user_data.pop("pending_input_action", None)
-                    context.user_data.pop("pending_task_id", None)
+                    user_data.pop("pending_input_action", None)
+                    user_data.pop("pending_task_id", None)
                     return
                 task.target_chat_id = forward_chat_id
                 session.commit()
@@ -3787,9 +3789,9 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     f"✅ 已自动确认并更新目标ID：{forward_chat_id}",
                     reply_markup=task_detail_keyboard(task.id),
                 )
-            context.user_data.pop("pending_input_action", None)
-            context.user_data.pop("pending_task_id", None)
-            context.user_data.pop("pending_forward_media_group_id", None)
+            user_data.pop("pending_input_action", None)
+            user_data.pop("pending_task_id", None)
+            user_data.pop("pending_forward_media_group_id", None)
             return
         await msg.reply_text(
             f"📌 已识别转发来源ID：`{forward_chat_id}`\n"
@@ -3798,7 +3800,7 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-    if msg.chat.type == "private" and context.user_data.get("pending_input_action") == "create_task_target" and not msg.text:
+    if msg.chat.type == "private" and user_data.get("pending_input_action") == "create_task_target" and not msg.text:
         await msg.reply_text("⚠️ 未识别到目标ID。请直接输入目标频道/群组ID，或转发一条来自目标频道/群组的消息。")
         return
     source_chat_id = msg.chat_id

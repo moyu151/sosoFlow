@@ -686,3 +686,25 @@
 ### 下一步建议（最高优先）
 
 - 在任务“最近日志”里补充展示 `publish_method`（copy/forward/send_media_group/direct_send_fallback），便于快速判断是主路径还是兜底路径生效。
+
+### 增量更新（channel_post 监听稳定性修复）
+
+- 修复源监听偶发中断：
+  - 根因：`channel_post/edited_channel_post` 场景下 `context.user_data` 可能为 `None`，导致 `capture_new_message` 在读取 pending 状态时报空指针
+  - 现象：日志出现 `AttributeError: 'NoneType' object has no attribute 'get'`，该条更新后续入队被中断
+  - 处理：在 `capture_new_message` 内统一使用安全局部变量 `user_data = context.user_data or {}`，替换相关读取与写入
+- 影响：
+  - 不再因私聊状态容器缺失而打断频道消息采集
+  - 源频道消息（含转发来源不同的帖子）采集链路稳定性提升
+- 本轮改动文件：
+  - `main.py`
+  - `PROJECT_LOG.md`
+
+### 已验证项
+
+- `python -m py_compile main.py` 通过
+- `pytest -q` 通过（45 passed）
+
+### 下一步建议（最高优先）
+
+- 增加一条 `capture_skip reason=...` 结构化日志（例如源关闭/非源匹配/权限拒绝），便于快速区分“未收到更新”与“收到但未入队”。
