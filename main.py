@@ -3793,12 +3793,13 @@ async def capture_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             user_data.pop("pending_task_id", None)
             user_data.pop("pending_forward_media_group_id", None)
             return
-        await msg.reply_text(
-            f"📌 已识别转发来源ID：`{forward_chat_id}`\n"
-            "可直接用于新建任务的来源或目标ID。\n"
-            "💡 点击数字可复制，然后发送给我确认；也可以在输入步骤直接转发，我会自动确认。",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        if msg.chat.type == "private":
+            await msg.reply_text(
+                f"📌 已识别转发来源ID：`{forward_chat_id}`\n"
+                "可直接用于新建任务的来源或目标ID。\n"
+                "💡 点击数字可复制，然后发送给我确认；也可以在输入步骤直接转发，我会自动确认。",
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
     if msg.chat.type == "private" and user_data.get("pending_input_action") == "create_task_target" and not msg.text:
         await msg.reply_text("⚠️ 未识别到目标ID。请直接输入目标频道/群组ID，或转发一条来自目标频道/群组的消息。")
